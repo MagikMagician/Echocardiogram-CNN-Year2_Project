@@ -33,31 +33,37 @@ from sklearn.metrics import accuracy_score, confusion_matrix, classification_rep
 # STEP 1: LOAD DATA FROM CSV
 # ==============================================================================
 def load_video_paths_and_labels():
-    df = pd.read_csv('dataset/FileList.csv', usecols=['FileName', 'Split'])
+    df = pd.read_csv('dataset/FileList.csv', usecols=['FileName', 'Split', 'EF'])
     train_videos = []
+    train_labels = []
 
     for index, row in df.iterrows():
         if row['Split'] == 'TRAIN':
             video_path = os.path.join('dataset/Videos', row['FileName'] + '.avi')
             if os.path.exists(video_path):
                 train_videos.append(video_path)
+                train_labels.append(row['EF'])
                 print(f"Found TRAIN video: {row['FileName']}")
             else:
                 print(f"Video not found: {video_path}")
 
+
     print(f"\nTotal TRAIN videos found: {len(train_videos)}")
 
-    df = pd.read_csv('dataset/FileList.csv', usecols=['FileName', 'Split'])
     val_videos = []
+    val_labels = []
     for index, row in df.iterrows():
         if row['Split'] == 'VAL':
             video_path = os.path.join('dataset/Videos', row['FileName'] + '.avi')
             if os.path.exists(video_path):
                 val_videos.append(video_path)
+                val_labels.append(row['EF'])
                 print(f"Found VAL video: {row['FileName']}")
             else:
                 print(f"Video not found: {video_path}")
     print(f"\nTotal VAL videos found: {len(val_videos)}")
+
+    return train_videos, train_labels, val_videos, val_labels
 # TODO: Read dataset/FileList.csv
 # TODO: Extract video paths and EF labels
 # TODO: Split into train/val sets using train_test_split
@@ -68,9 +74,11 @@ def load_video_paths_and_labels():
 # ==============================================================================
 class EchoDataset(Dataset):
     def __init__(self, video_paths, labels, num_frames=16, transform=None):
-        # TODO: Store video_paths, labels, num_frames, transform
-        pass
-        
+        self.video_paths = video_paths
+        self.labels = labels
+        self.num_frames = num_frames
+        self.transform = transform
+    
     def __len__(self):
         # TODO: Return total number of videos
         pass
@@ -151,4 +159,5 @@ class CNN3D(nn.Module):
 # TODO: Evaluate on validation set
 # TODO: Calculate metrics (MAE, RMSE for EF prediction)
 # TODO: Visualize predictions vs actual
-load_video_paths_and_labels()
+train_videos, train_labels, val_videos, val_labels = load_video_paths_and_labels()
+train_dataset = EchoDataset(video_paths=train_videos, labels=train_labels)
