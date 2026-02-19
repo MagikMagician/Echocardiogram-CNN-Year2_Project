@@ -32,37 +32,37 @@ from sklearn.metrics import accuracy_score, confusion_matrix, classification_rep
 # ==============================================================================
 # STEP 1: LOAD DATA FROM CSV
 # ==============================================================================
+def split_data(df, split_type, video_dir='dataset/Videos'):
+    """Helper function to load videos and labels for a specific split type."""
+    videos = []
+    labels = []
+    
+    for index, row in df.iterrows():
+        if row['Split'] == split_type:
+            video_path = os.path.join(video_dir, row['FileName'] + '.avi')
+            if os.path.exists(video_path):
+                videos.append(video_path)
+                labels.append(row['EF'])
+                # print(f"Found {split_type} video: {row['FileName']}")
+            else:
+                print(f"Video not found: {video_path}")
+    
+    print(f"\nTotal {split_type} videos found: {len(videos)}")
+    return videos, labels
+
+
 def load_video_paths_and_labels():
-    df = pd.read_csv('dataset/FileList.csv', usecols=['FileName', 'Split', 'EF'])
-    train_videos = []
-    train_labels = []
+    data_path = 'C:\\Users\\aaron\\Downloads\\EchoNet-Dynamic'
+    file_list_path = os.path.join(data_path, 'FileList.csv')
+    video_dir_path = os.path.join(data_path, 'Videos')
 
-    for index, row in df.iterrows():
-        if row['Split'] == 'TRAIN':
-            video_path = os.path.join('dataset/Videos', row['FileName'] + '.avi')
-            if os.path.exists(video_path):
-                train_videos.append(video_path)
-                train_labels.append(row['EF'])
-                print(f"Found TRAIN video: {row['FileName']}")
-            else:
-                print(f"Video not found: {video_path}")
+    print(f"Loading data from: {file_list_path}")
 
-
-    print(f"\nTotal TRAIN videos found: {len(train_videos)}")
-
-    val_videos = []
-    val_labels = []
-    for index, row in df.iterrows():
-        if row['Split'] == 'VAL':
-            video_path = os.path.join('dataset/Videos', row['FileName'] + '.avi')
-            if os.path.exists(video_path):
-                val_videos.append(video_path)
-                val_labels.append(row['EF'])
-                print(f"Found VAL video: {row['FileName']}")
-            else:
-                print(f"Video not found: {video_path}")
-    print(f"\nTotal VAL videos found: {len(val_videos)}")
-
+    df = pd.read_csv(file_list_path, usecols=['FileName', 'Split', 'EF'])
+    
+    train_videos, train_labels = split_data(df, 'TRAIN', video_dir_path)
+    val_videos, val_labels = split_data(df, 'VAL', video_dir_path)
+    
     return train_videos, train_labels, val_videos, val_labels
 # TODO: Read dataset/FileList.csv
 # TODO: Extract video paths and EF labels
