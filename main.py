@@ -62,7 +62,7 @@ def load_video_paths_and_labels():
     Load EchoNet-Dynamic dataset from FileList.csv.
     Returns train/val/test splits with video paths and EF labels.
     """
-    data_path = 'C:\\Users\\aaron\\Downloads\\EchoNet-Dynamic'  # Adjust if your dataset is in a different location
+    data_path = 'dataset'  # Adjust if your dataset is in a different location
     file_list_path = os.path.join(data_path, 'FileList.csv')
     video_dir_path = os.path.join(data_path, 'Videos')
 
