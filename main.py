@@ -78,10 +78,6 @@ class Config:
     NUM_EPOCHS = 50
     PATIENCE = 10  # Early stopping patience
     
-    # Logging
-    LOG_LEVEL = logging.INFO
-    LOG_FORMAT = '%(asctime)s - %(levelname)s - %(message)s'
-    
     @property
     def target_size(self) -> Tuple[int, int]:
         """Return target frame size as (height, width) tuple."""
@@ -102,11 +98,8 @@ class Config:
         """Return full path to statistics cache file."""
         return Path(self.STATS_CACHE_FILE)
 
-
-# Initialize configuration and logging
+# Initialize configuration
 config = Config()
-logging.basicConfig(level=config.LOG_LEVEL, format=config.LOG_FORMAT)
-logger = logging.getLogger(__name__)
 
 # ==============================================================================
 # STEP 1: DATA LOADING UTILITIES
@@ -139,9 +132,9 @@ def split_data(df: pd.DataFrame, split_type: str, video_dir: Path) -> Tuple[List
             labels.append(float(row['EF']))
         else:
             missing_count += 1
-            logger.warning(f"Video not found: {video_path}")
+            print(f"Video not found: {video_path}")
     
-    logger.info(f"{split_type}: {len(videos)} videos found, {missing_count} missing")
+    print(f"{split_type}: {len(videos)} videos found, {missing_count} missing")
     
     return videos, labels
 
@@ -169,7 +162,7 @@ def load_video_paths_and_labels() -> Tuple[List[str], List[float], List[str], Li
             f"Videos directory not found at {config.video_dir_path}"
         )
     
-    logger.info(f"Loading data from: {config.file_list_path}")
+    print(f"Loading data from: {config.file_list_path}")
     
     # Read CSV and validate columns
     try:
@@ -230,19 +223,19 @@ def load_frames_from_video(video_path: str, num_frames: int, target_size: Tuple[
         cap = cv2.VideoCapture(video_path)
         
         if not cap.isOpened():
-            logger.warning(f"Cannot open video: {video_path}")
+            print(f"Cannot open video: {video_path}")
             return None
         
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         
         if total_frames == 0:
-            logger.warning(f"Video has 0 frames: {video_path}")
+            print(f"Video has 0 frames: {video_path}")
             cap.release()
             return None
         
         # Determine frame indices to extract
         if total_frames < num_frames:
-            logger.debug(f"Video has only {total_frames} frames, need {num_frames}")
+            print(f"Video has only {total_frames} frames, need {num_frames}")
             frame_indices = np.arange(total_frames)
         else:
             frame_indices = np.linspace(0, total_frames - 1, num_frames, dtype=int)
@@ -271,12 +264,12 @@ def load_frames_from_video(video_path: str, num_frames: int, target_size: Tuple[
         # Pad with zeros if we didn't get enough frames
         while len(frames) < num_frames:
             frames.append(np.zeros(target_size, dtype=np.uint8))
-            logger.debug(f"Padded frame for {video_path}")
+            print(f"Padded frame for {video_path}")
         
         return np.array(frames[:num_frames], dtype=np.float32)
         
     except Exception as e:
-        logger.error(f"Error loading video {video_path}: {e}")
+        print(f"Error loading video {video_path}: {e}")
         return None
 
 
@@ -308,12 +301,12 @@ def compute_dataset_statistics(
             with open(cache_file, 'r') as f:
                 stats = json.load(f)
             mean, std = stats['mean'], stats['std']
-            logger.info(f"Loaded cached statistics - Mean: {mean:.4f}, Std: {std:.4f}")
+            print(f"Loaded cached statistics - Mean: {mean:.4f}, Std: {std:.4f}")
             return mean, std
         except Exception as e:
-            logger.warning(f"Failed to load cached statistics: {e}")
+            print(f"Failed to load cached statistics: {e}")
     
-    logger.info(f"Computing dataset statistics from {num_samples} videos...")
+    print(f"Computing dataset statistics from {num_samples} videos...")
     
     # Sample random videos
     num_samples = min(num_samples, len(video_paths))
@@ -330,7 +323,7 @@ def compute_dataset_statistics(
             successful += 1
     
     if len(all_pixels) == 0:
-        logger.error("No valid frames found for statistics computation")
+        print("No valid frames found for statistics computation")
         return config.DEFAULT_MEAN, config.DEFAULT_STD
         
     # Compute statistics
@@ -338,15 +331,15 @@ def compute_dataset_statistics(
     mean = float(np.mean(all_pixels))
     std = float(np.std(all_pixels))
     
-    logger.info(f"Dataset statistics - Mean: {mean:.4f}, Std: {std:.4f}")
+    print(f"Dataset statistics - Mean: {mean:.4f}, Std: {std:.4f}")
     
     # Cache the results
     try:
         with open(cache_file, 'w') as f:
             json.dump({'mean': mean, 'std': std}, f)
-        logger.info(f"Statistics cached to {cache_file}")
+        print(f"Statistics cached to {cache_file}")
     except Exception as e:
-        logger.warning(f"Failed to cache statistics: {e}")
+        print(f"Failed to cache statistics: {e}")
     
     return mean, std
 
@@ -421,7 +414,7 @@ class EchoDataset(Dataset):
         
         # Fallback to zeros if loading failed (keeps batch sizes consistent)
         if frames is None:
-            logger.warning(f"Using zero frames for failed video: {video_path}")
+            print(f"Using zero frames for failed video: {video_path}")
             frames = np.zeros(
                 (self.num_frames, *self.target_size), 
                 dtype=np.float32
@@ -432,7 +425,7 @@ class EchoDataset(Dataset):
         if self.std > 0:
             frames = (frames - self.mean) / self.std  # Standardize
         else:
-            logger.warning(f"Invalid std={self.std}, skipping standardization")
+            print(f"Invalid std={self.std}, skipping standardization")
         
         # Convert to torch tensor: (1, num_frames, H, W) for grayscale
         video_tensor = torch.from_numpy(frames).unsqueeze(0).float()
@@ -572,7 +565,7 @@ def create_dataloaders() -> Tuple[DataLoader, DataLoader, DataLoader]:
         FileNotFoundError: If dataset files not found
         ValueError: If dataset is invalid
     """
-    logger.info("INITIALIZING ECHONET-DYNAMIC DATASET")
+    print("INITIALIZING ECHONET-DYNAMIC DATASET")
     
     # Load video paths and labels
     train_videos, train_labels, val_videos, val_labels, test_videos, test_labels = \
@@ -583,7 +576,7 @@ def create_dataloaders() -> Tuple[DataLoader, DataLoader, DataLoader]:
     # Results are cached to avoid recomputation
     dataset_mean, dataset_std = compute_dataset_statistics(train_videos)
 
-    logger.info(f"Initializing datasets...")
+    print(f"Initializing datasets...")
     # Create datasets with computed statistics
     train_dataset = EchoDataset(
         video_paths=train_videos, 
@@ -631,12 +624,12 @@ def create_dataloaders() -> Tuple[DataLoader, DataLoader, DataLoader]:
         pin_memory=True if torch.cuda.is_available() else False
     )
     
-    logger.info("Dataset Summary:")
-    logger.info(f"  Train: {len(train_dataset)} videos")
-    logger.info(f"  Val:   {len(val_dataset)} videos")
-    logger.info(f"  Test:  {len(test_dataset)} videos")
-    logger.info(f"  Batch size: {config.BATCH_SIZE}")
-    logger.info(f"  Normalization: mean={dataset_mean:.4f}, std={dataset_std:.4f}")
+    print("Dataset Summary:")
+    print(f"  Train: {len(train_dataset)} videos")
+    print(f"  Val:   {len(val_dataset)} videos")
+    print(f"  Test:  {len(test_dataset)} videos")
+    print(f"  Batch size: {config.BATCH_SIZE}")
+    print(f"  Normalization: mean={dataset_mean:.4f}, std={dataset_std:.4f}")
     
     return train_loader, val_loader, test_loader
 
@@ -646,17 +639,17 @@ if __name__ == "__main__":
         # Create dataloaders
         train_loader, val_loader, test_loader = create_dataloaders()
         
-        logger.info("Data pipeline initialized.")
-        logger.info(f"  GPU available: {torch.cuda.is_available()}")
+        print("Data pipeline initialized.")
+        print(f"  GPU available: {torch.cuda.is_available()}")
         if torch.cuda.is_available():
-            logger.info(f"  GPU device: {torch.cuda.get_device_name(0)}")
+            print(f"  GPU device: {torch.cuda.get_device_name(0)}")
         
         # TODO: Add model initialization, training, and evaluation here
         
     except FileNotFoundError as e:
-        logger.error(f"Dataset not found: {e}")
-        logger.error("Please update Config.DATASET_PATH in the configuration section")
+        print(f"Dataset not found: {e}")
+        print("Please update Config.DATASET_PATH in the configuration section")
         raise
     except Exception as e:
-        logger.error(f"Unexpected error: {e}")
+        print(f"Unexpected error: {e}")
         raise
