@@ -24,6 +24,7 @@ __pycache__/
 *.dicom
 data/
 dataset/
+dataset_statistics.json
 
 # IDE
 .vscode/
