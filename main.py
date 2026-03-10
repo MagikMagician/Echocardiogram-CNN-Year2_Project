@@ -62,7 +62,7 @@ def load_video_paths_and_labels():
     Load EchoNet-Dynamic dataset from FileList.csv.
     Returns train/val/test splits with video paths and EF labels.
     """
-    data_path = 'dataset'  # Adjust if your dataset is in a different location
+    data_path = 'C:\\Users\\aaron\\Downloads\\EchoNet-Dynamic'  # Adjust if your dataset is in a different location
     file_list_path = os.path.join(data_path, 'FileList.csv')
     video_dir_path = os.path.join(data_path, 'Videos')
 
@@ -92,11 +92,77 @@ def convert_ef_to_category(ef):
         return 2  # Preserved
 
 
+def compute_dataset_statistics(video_paths, num_samples=100, num_frames=16):
+    """
+    Compute mean and std across a sample of videos for normalization.
+    Computing on all 10,000 videos would be slow, so sample a subset.
+    
+    Args:
+        video_paths: List of video paths
+        num_samples: Number of videos to sample for statistics
+        num_frames: Number of frames per video
+    
+    Returns:
+        mean, std: Normalization statistics
+    """
+    print(f"Computing dataset statistics from {num_samples} videos...")
+    
+    # Sample random videos
+    sample_indices = np.random.choice(len(video_paths), 
+                                     min(num_samples, len(video_paths)), 
+                                     replace=False)
+    
+    all_pixels = []
+    
+    for idx in tqdm(sample_indices, desc="Sampling videos"):
+        try:
+            cap = cv2.VideoCapture(video_paths[idx])
+            if not cap.isOpened():
+                continue
+                
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            frame_indices = np.linspace(0, total_frames - 1, num_frames, dtype=int)
+            
+            current_idx = 0
+            frame_count = 0
+            
+            while frame_count < num_frames:
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                    
+                if current_idx in frame_indices:
+                    if len(frame.shape) == 3:
+                        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                    frame = cv2.resize(frame, (112, 112))
+                    all_pixels.append(frame.flatten())
+                    frame_count += 1
+                
+                current_idx += 1
+            
+            cap.release()
+        except Exception as e:
+            print(f"Error reading video {video_paths[idx]}: {e}")
+            continue
+    
+    if len(all_pixels) == 0:
+        print("Warning: No valid frames found, using default normalization")
+        return 0.5, 0.5
+    
+    all_pixels = np.concatenate(all_pixels) / 255.0  # Scale to [0, 1]
+    mean = np.mean(all_pixels)
+    std = np.std(all_pixels)
+    
+    print(f"Dataset statistics - Mean: {mean:.4f}, Std: {std:.4f}")
+    return mean, std
+
+
 # ==============================================================================
 # STEP 2: DATASET CLASS - Loads echocardiogram videos as temporal sequences
 # ==============================================================================
 class EchoDataset(Dataset):
-    def __init__(self, video_paths, labels, num_frames=16, transform=None):
+    def __init__(self, video_paths, labels, num_frames=16, transform=None, 
+                 mean=0.0, std=1.0, target_size=(112, 112)):
         """
         Dataset for echocardiogram videos.
         Args:
@@ -104,27 +170,104 @@ class EchoDataset(Dataset):
             labels: List of EF values (continuous)
             num_frames: Number of frames to extract per video
             transform: Optional transforms for preprocessing
+            mean: Dataset mean for normalization (compute once across dataset)
+            std: Dataset std for normalization (compute once across dataset)
+            target_size: Resize dimensions (height, width)
         """
         self.video_paths = video_paths
         self.labels = labels
         self.num_frames = num_frames
         self.transform = transform
+        self.mean = mean
+        self.std = std
+        self.target_size = target_size
     
     def __len__(self):
-        # TODO: Return total number of videos
-        pass
+        return len(self.video_paths)
+    
+    def load_video_frames(self, video_path):
+        """
+        Load frames from video with error handling.
+        Returns frames array or None if loading fails.
+        """
+        try:
+            cap = cv2.VideoCapture(video_path)
+            
+            if not cap.isOpened():
+                print(f"Warning: Cannot open video {video_path}")
+                return None
+            
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            
+            if total_frames < self.num_frames:
+                print(f"Warning: Video {video_path} has only {total_frames} frames, need {self.num_frames}")
+                # Adjust to available frames
+                frame_indices = np.arange(total_frames)
+            else:
+                # Extract num_frames frames uniformly across video
+                frame_indices = np.linspace(0, total_frames - 1, self.num_frames, dtype=int)
+            
+            frames = []
+            
+            # Read all frames sequentially (faster than seeking)
+            current_idx = 0
+            frame_idx_set = set(frame_indices)
+            
+            while len(frames) < len(frame_indices):
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                
+                if current_idx in frame_idx_set:
+                    # Convert to grayscale
+                    if len(frame.shape) == 3:
+                        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                    # Resize to target size
+                    frame = cv2.resize(frame, self.target_size)
+                    frames.append(frame)
+                
+                current_idx += 1
+            
+            cap.release()
+            
+            # Pad with zeros if we didn't get enough frames
+            while len(frames) < self.num_frames:
+                frames.append(np.zeros(self.target_size, dtype=np.uint8))
+            
+            return np.array(frames[:self.num_frames], dtype=np.float32)
+            
+        except Exception as e:
+            print(f"Error loading video {video_path}: {e}")
+            return None
         
     def __getitem__(self, idx):
-        # TODO: Get video path and EF label at index idx
-        # TODO: Open video with cv2.VideoCapture()
-        # TODO: Extract num_frames frames uniformly across cardiac cycle
-        # TODO: Convert frames to numpy array shape (num_frames, H, W)
-        # TODO: Resize frames to consistent size (e.g., 112x112 for 3D CNN)
-        # TODO: Normalize pixel values (mean/std normalization)
-        # TODO: Convert to torch tensor: (1, num_frames, H, W) for grayscale
-        # TODO: Convert EF to clinical category using convert_ef_to_category()
-        # TODO: Return (video_tensor, ef_continuous, ef_category)
-        pass
+        # Get video path and EF label at index idx
+        video_path = self.video_paths[idx]
+        ef_continuous = self.labels[idx]
+        
+        # Load video frames with error handling
+        frames = self.load_video_frames(video_path)
+        
+        # If video loading failed, return zeros (or skip - but this keeps batch sizes consistent)
+        if frames is None:
+            frames = np.zeros((self.num_frames, *self.target_size), dtype=np.float32)
+        
+        # Normalize pixel values using dataset-wide statistics
+        frames = frames / 255.0  # Scale to [0, 1]
+        if self.std > 0:
+            frames = (frames - self.mean) / self.std  # Standardize
+        
+        # Convert to torch tensor: (1, num_frames, H, W) for grayscale
+        video_tensor = torch.from_numpy(frames).unsqueeze(0)  # Add channel dimension
+        
+        # Convert EF to clinical category
+        ef_category = convert_ef_to_category(ef_continuous)
+        
+        # Apply optional transforms
+        if self.transform:
+            video_tensor = self.transform(video_tensor)
+        
+        return video_tensor, torch.tensor(ef_continuous, dtype=torch.float32), torch.tensor(ef_category, dtype=torch.long)
 
 
 # ==============================================================================
@@ -236,5 +379,29 @@ class CNN3D(nn.Module):
 # ==============================================================================
 # MAIN EXECUTION
 # ==============================================================================
+# Load video paths and labels
 train_videos, train_labels, val_videos, val_labels, test_videos, test_labels = load_video_paths_and_labels()
-train_dataset = EchoDataset(video_paths=train_videos, labels=train_labels)
+
+# Compute dataset-wide normalization statistics from training set
+# This ensures consistent normalization across all videos
+dataset_mean, dataset_std = compute_dataset_statistics(train_videos, num_samples=100, num_frames=16)
+
+# Create datasets with computed statistics
+train_dataset = EchoDataset(video_paths=train_videos, labels=train_labels, 
+                           mean=dataset_mean, std=dataset_std)
+val_dataset = EchoDataset(video_paths=val_videos, labels=val_labels,
+                         mean=dataset_mean, std=dataset_std)
+test_dataset = EchoDataset(video_paths=test_videos, labels=test_labels,
+                          mean=dataset_mean, std=dataset_std)
+
+# Create DataLoaders
+# NOTE: Use num_workers=0 to avoid OpenCV multi-threading issues
+# Increase batch_size if you have enough GPU memory (start with 4-8)
+train_loader = DataLoader(train_dataset, batch_size=4, shuffle=True, num_workers=0)
+val_loader = DataLoader(val_dataset, batch_size=4, shuffle=False, num_workers=0)
+test_loader = DataLoader(test_dataset, batch_size=4, shuffle=False, num_workers=0)
+
+print(f"\nDataset sizes:")
+print(f"Train: {len(train_dataset)} videos")
+print(f"Val: {len(val_dataset)} videos")
+print(f"Test: {len(test_dataset)} videos")
