@@ -25,6 +25,7 @@ __pycache__/
 data/
 dataset/
 dataset_statistics.json
+local_config.json
 
 # IDE
 .vscode/
