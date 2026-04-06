@@ -364,10 +364,6 @@ class EchoDataset(Dataset):
 # ==============================================================================
 # STEP 4: CREATE DATALOADERS
 # ==============================================================================
-# DONE: Load data using load_video_paths_and_labels()
-# DONE: Create train_dataset, val_dataset, test_dataset using EchoDataset
-# DONE: Create DataLoaders with appropriate batch_size (4-8 for memory efficiency)
-# DONE: Use num_workers for parallel data loading
 # TODO: Apply data augmentation transforms for training (optional)
 
 
