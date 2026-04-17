@@ -19,24 +19,62 @@ class CNN3D(nn.Module):
             num_classes: Number of EF categories (3: Reduced, Mildly Reduced, Preserved)
         """
         super(CNN3D, self).__init__()
-        # TODO: Define Conv3d layers for spatial-temporal feature extraction
-        # Example: self.conv1 = nn.Conv3d(in_channels=1, out_channels=32, kernel_size=(3,3,3), padding=1)
-        # TODO: Define BatchNorm3d for normalization
-        # TODO: Define MaxPool3d layers for downsampling
-        # TODO: Define fully connected layers for regression and classification
-        # TODO: Regression head: outputs continuous EF value
-        # TODO: Classification head: outputs 3 class probabilities
-        pass
+
+        def conv_block(
+            in_channels: int,
+            out_channels: int,
+            pool_kernel: Tuple[int, int, int],
+        ) -> nn.Sequential:
+            """Create one convolutional block for spatiotemporal feature extraction."""
+            return nn.Sequential(
+                nn.Conv3d(
+                    in_channels=in_channels,
+                    out_channels=out_channels,
+                    kernel_size=(3, 3, 3),
+                    padding=1,
+                    bias=False,
+                ),
+                nn.BatchNorm3d(out_channels),
+                nn.ReLU(inplace=True),
+                nn.MaxPool3d(kernel_size=pool_kernel),
+            )
+
+        self.feature_extractor = nn.Sequential(
+            conv_block(1, 32, pool_kernel=(1, 2, 2)),
+            conv_block(32, 64, pool_kernel=(2, 2, 2)),
+            conv_block(64, 128, pool_kernel=(2, 2, 2)),
+        )
+
+        # Adaptive pooling keeps the model compatible with different frame counts/resolutions.
+        self.global_pool = nn.AdaptiveAvgPool3d((1, 1, 1))
+
+        self.shared_head = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(128, 64),
+            nn.ReLU(inplace=True),
+            nn.Dropout(p=0.3),
+        )
+
+        self.regression_head = nn.Linear(64, 1)
+        self.classification_head = nn.Linear(64, num_classes)
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        # Input x shape: (batch, 1, time, height, width)
-        # TODO: Pass through conv3d + batchnorm + relu + maxpool layers
-        # TODO: Flatten spatial-temporal features
-        # TODO: Pass through fully connected layers
-        # TODO: Regression output: single EF value
-        # TODO: Classification output: 3-class probabilities (softmax)
-        # TODO: Return (ef_regression, ef_classification)
-        pass
+        """Return continuous EF prediction and classification logits."""
+        if x.ndim != 5:
+            raise ValueError(
+                "Expected input shape (batch, 1, time, height, width), "
+                f"received {tuple(x.shape)}"
+            )
+
+        features = self.feature_extractor(x)
+        pooled = self.global_pool(features)
+        embedding = self.shared_head(pooled)
+
+        ef_regression = self.regression_head(embedding).squeeze(-1)
+        # Return logits for CrossEntropyLoss; apply softmax only for reporting/inference.
+        ef_classification = self.classification_head(embedding)
+
+        return ef_regression, ef_classification
 
 
 # ==============================================================================
