@@ -1,13 +1,9 @@
 # Core Deep Learning
 import torch
 
-# Data, Model, and Analysis Modules
+# Data, Training, and Analysis Modules
 from src.data_processing import create_dataloaders
-from src.CNN_model import (
-    CNN3D,
-    initialize_training_components,
-    train_model,
-)
+from src.training import initialize_training_components, train_model
 from src.analysis import (
     evaluate_on_test_set,
     run_gradcam_visualization,
@@ -27,7 +23,7 @@ def run_pipeline() -> None:
     Run the end-to-end project pipeline by orchestrating all module steps.
     """
     # STEP 4: CREATE DATALOADERS
-    train_loader, val_loader, test_loader = create_dataloaders()
+    train_loader, val_loader, _ = create_dataloaders()
 
     print("Data pipeline initialized.")
     print(f"  GPU available: {torch.cuda.is_available()}")
@@ -35,10 +31,11 @@ def run_pipeline() -> None:
         print(f"  GPU device: {torch.cuda.get_device_name(0)}")
 
     # STEP 5: INITIALIZE MODEL, LOSS, OPTIMIZER
+    components = initialize_training_components()
+
     # STEP 6: TRAINING LOOP
-    # These are currently placeholders inside model_running.py.
-    initialize_training_components()
-    train_model()
+    history = train_model(train_loader, val_loader, components)
+    print(f"Training complete. Epochs run: {len(history['train_loss'])}")
 
     # STEP 7: EVALUATION ON TEST SET
     evaluate_on_test_set()
@@ -48,10 +45,6 @@ def run_pipeline() -> None:
 
     # STEP 9: ABLATION STUDY (OPTIONAL)
     run_ablation_study()
-
-    # Reference the model class in main orchestration scope.
-    _ = (CNN3D, train_loader, val_loader, test_loader)
-
 
 if __name__ == "__main__":
     try:

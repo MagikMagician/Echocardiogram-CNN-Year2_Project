@@ -1,10 +1,8 @@
 # Core Deep Learning
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-import torch.optim as optim
 
-# Data Processing
+# Typing
 from typing import Tuple
 
 # ==============================================================================
@@ -18,7 +16,10 @@ class CNN3D(nn.Module):
         Args:
             num_classes: Number of EF categories (3: Reduced, Mildly Reduced, Preserved)
         """
-        super(CNN3D, self).__init__()
+        if num_classes < 2:
+            raise ValueError("num_classes must be at least 2 for classification.")
+
+        super().__init__()
 
         def conv_block(
             in_channels: int,
@@ -40,6 +41,7 @@ class CNN3D(nn.Module):
             )
 
         self.feature_extractor = nn.Sequential(
+            # Keep temporal resolution in the first block, then downsample.
             conv_block(1, 32, pool_kernel=(1, 2, 2)),
             conv_block(32, 64, pool_kernel=(2, 2, 2)),
             conv_block(64, 128, pool_kernel=(2, 2, 2)),
@@ -55,6 +57,7 @@ class CNN3D(nn.Module):
             nn.Dropout(p=0.3),
         )
 
+        # Task-specific heads from the same shared representation.
         self.regression_head = nn.Linear(64, 1)
         self.classification_head = nn.Linear(64, num_classes)
 
@@ -65,58 +68,19 @@ class CNN3D(nn.Module):
                 "Expected input shape (batch, 1, time, height, width), "
                 f"received {tuple(x.shape)}"
             )
+        if x.size(1) != 1:
+            raise ValueError(
+                "Expected a single-channel grayscale input at dimension 1, "
+                f"received {x.size(1)} channels"
+            )
 
         features = self.feature_extractor(x)
         pooled = self.global_pool(features)
         embedding = self.shared_head(pooled)
 
+        # Match regression target shape: (batch,).
         ef_regression = self.regression_head(embedding).squeeze(-1)
-        # Return logits for CrossEntropyLoss; apply softmax only for reporting/inference.
+        # CrossEntropyLoss expects raw logits.
         ef_classification = self.classification_head(embedding)
 
         return ef_regression, ef_classification
-
-
-# ==============================================================================
-# STEP 5: INITIALIZE MODEL, LOSS, OPTIMIZER
-# ==============================================================================
-# TODO: Set device (cuda if available, else cpu)
-# TODO: Initialize CNN3D model and move to device
-# TODO: Define regression loss: MSELoss for continuous EF prediction
-# TODO: Define classification loss: CrossEntropyLoss for clinical categories
-# TODO: Define optimizer: Adam with appropriate learning rate
-# TODO: Optional: Define learning rate scheduler
-
-
-# ==============================================================================
-# STEP 6: TRAINING LOOP
-# ==============================================================================
-# TODO: Loop over epochs
-#   TODO: Set model to train mode
-#   TODO: Loop over batches in train_loader
-#       TODO: Move data to device
-#       TODO: Forward pass: get regression and classification outputs
-#       TODO: Calculate regression loss (MSE)
-#       TODO: Calculate classification loss (CrossEntropy)
-#       TODO: Combine losses (weighted sum)
-#       TODO: Backward pass and optimizer step
-#       TODO: Track training metrics (loss, MAE)
-#   TODO: Validation loop
-#       TODO: Set model to eval mode
-#       TODO: Calculate validation losses and metrics
-#       TODO: Calculate MAE, MSE, R² for regression
-#       TODO: Calculate accuracy, precision, recall, F1 for classification
-#   TODO: Save best model based on validation performance
-#   TODO: Print epoch results and plot loss curves
-
-
-def initialize_training_components() -> None:
-    """Placeholder for model/loss/optimizer setup implementation."""
-    # TODO: Implement model initialization, losses, optimizer, and scheduler setup.
-    pass
-
-
-def train_model() -> None:
-    """Placeholder for training loop implementation."""
-    # TODO: Implement epoch and batch training loops with validation.
-    pass
