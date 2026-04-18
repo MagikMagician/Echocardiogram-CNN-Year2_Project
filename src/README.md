@@ -41,8 +41,9 @@
 ## Minimal Progress Checklist
 - [x] Data loading + preprocessing
 - [x] Dataset + DataLoaders
+- [x] Data augmentation (horizontal flip, random affine for training)
 - [x] CNN architecture
 - [x] Training loop
-- [ ] Test evaluation
-- [ ] Grad-CAM
-- [ ] Ablation study
+- [x] Test evaluation (MAE, RMSE, R², accuracy, ROC-AUC, confusion matrix, scatter plot)
+- [x] Grad-CAM visualizations
+- [x] Ablation study (frame count, loss weight variants)

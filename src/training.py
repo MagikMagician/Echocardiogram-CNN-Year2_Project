@@ -7,7 +7,7 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
 
-from src.CNN_model import CNN3D
+from src.CNN_model import CNN3D, R2Plus1DEF
 from src.config import Config
 
 config = Config()
@@ -21,11 +21,11 @@ class TrainingComponents:
     """Bundle model and optimization objects used during training."""
 
     device: torch.device
-    model: CNN3D
+    model: nn.Module
     regression_loss_fn: nn.Module
     classification_loss_fn: nn.Module
     optimizer: optim.Optimizer
-    scheduler: Optional[optim.lr_scheduler.ReduceLROnPlateau]
+    scheduler: Optional[object]
 
 
 def _empty_epoch_metrics() -> EpochMetrics:
@@ -47,21 +47,22 @@ def _empty_epoch_metrics() -> EpochMetrics:
 def initialize_training_components(
     learning_rate: float = config.LEARNING_RATE,
     num_classes: int = config.NUM_CATEGORIES,
+    class_weights: Optional[torch.Tensor] = None,
 ) -> TrainingComponents:
     """Initialize model, losses, optimizer, and scheduler."""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    model = CNN3D(num_classes=num_classes).to(device)
+    # R2+1D with Kinetics-400 pretrained weights (EchoNet-Dynamic paper).
+    model = R2Plus1DEF(num_classes=num_classes).to(device)
     regression_loss_fn = nn.MSELoss()
-    classification_loss_fn = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.parameters(), lr=learning_rate)
-    # Reduce learning rate when validation loss plateaus.
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer,
-        mode="min",
-        factor=0.5,
-        patience=3,
+    # Move class weights to the same device so the loss computation stays on GPU.
+    classification_loss_fn = nn.CrossEntropyLoss(
+        weight=class_weights.to(device) if class_weights is not None else None
     )
+    # SGD + momentum=0.9 matches the EchoNet-Dynamic paper exactly.
+    optimizer = optim.SGD(model.parameters(), lr=learning_rate, momentum=0.9)
+    # Decay LR by ×0.1 every 15 epochs (paper specification).
+    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=15, gamma=0.1)
 
     return TrainingComponents(
         device=device,
@@ -148,9 +149,9 @@ def train_model(
     components: TrainingComponents,
     num_epochs: int = config.NUM_EPOCHS,
     regression_weight: float = 1.0,
-    classification_weight: float = 1.0,
+    classification_weight: float = 0.1,  # auxiliary; paper is regression-only
     early_stopping_patience: int = config.PATIENCE,
-    checkpoint_path: Path = Path("artifacts/best_cnn3d.pt"),
+    checkpoint_path: Path = Path("artifacts/best_r2plus1d.pt"),
 ) -> TrainingHistory:
     """Train the model with validation and simple early stopping."""
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
@@ -185,8 +186,8 @@ def train_model(
         )
 
         if components.scheduler is not None:
-            # Scheduler tracks validation loss, not training loss.
-            components.scheduler.step(val_metrics["loss"])
+            # StepLR steps unconditionally each epoch.
+            components.scheduler.step()
 
         history["train_loss"].append(train_metrics["loss"])
         history["train_mae"].append(train_metrics["mae"])

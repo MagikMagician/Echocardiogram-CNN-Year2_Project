@@ -1,6 +1,8 @@
 # Core Deep Learning
-torch>=2.0.0
-torchvision>=0.15.0
+# Install with CUDA 12.8 support
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
+torch>=2.7.0
+torchvision>=0.22.0
 
 # Data Processing
 numpy>=1.24.0
