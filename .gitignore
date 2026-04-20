@@ -15,7 +15,7 @@ __pycache__/
 
 # PyTorch
 *.pth
-*.pt
+
 
 # Data
 *.csv
