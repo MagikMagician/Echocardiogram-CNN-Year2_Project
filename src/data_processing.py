@@ -1,5 +1,4 @@
 # Core Deep Learning
-from sympy import im
 import torch
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
@@ -7,6 +6,7 @@ from torchvision import transforms
 # Data Processing
 import numpy as np
 import pandas as pd
+from collections import Counter
 from typing import List, Tuple, Optional
 from pathlib import Path
 
@@ -127,17 +127,31 @@ def convert_ef_to_category(ef: float) -> int:
     return 2  # Preserved
 
 
-def load_frames_from_video(video_path: str, num_frames: int, target_size: Tuple[int, int]) -> Optional[np.ndarray]:
+def load_frames_from_video(
+    video_path: str,
+    num_frames: int,
+    target_size: Tuple[int, int],
+    period: int = 1,
+    random_start: bool = False,
+) -> Optional[np.ndarray]:
     """
-    Extract frames uniformly from a video file.
+    Extract frames from a video using contiguous-window period sampling.
+
+    Matches the EchoNet-Dynamic paper: 32 frames sampled every ``period``
+    frames from a contiguous window (period=2 → 64-frame window ≈ 1.28 s
+    at 50 fps). Training uses a random start position (augmentation);
+    val/test use the centred window.
 
     Args:
-        video_path: Path to video file
-        num_frames: Number of frames to extract
-        target_size: (height, width) to resize frames to
+        video_path: Path to video file.
+        num_frames: Number of frames to return.
+        target_size: (width, height) for cv2.resize — must be square for this project.
+        period: Temporal stride between sampled frames (paper default: 2).
+        random_start: If True pick a random clip start (training); otherwise use
+                      the centred window (val/test).
 
     Returns:
-        Array of shape (num_frames, height, width) or None if loading fails
+        Float32 array of shape (num_frames, H, W), or None on failure.
     """
     try:
         cap = cv2.VideoCapture(video_path)
@@ -149,42 +163,41 @@ def load_frames_from_video(video_path: str, num_frames: int, target_size: Tuple[
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
         if total_frames == 0:
-            print(f"Video has 0 frames: {video_path}")
             cap.release()
             return None
 
-        # Determine frame indices to extract
-        if total_frames < num_frames:
-            print(f"Video has only {total_frames} frames, need {num_frames}")
-            frame_indices = np.arange(total_frames)
-        else:
+        # Window of raw frames needed for num_frames at the given period
+        window = num_frames * period
+
+        if total_frames <= window:
+            # Not enough frames — fall back to evenly spaced sampling across whole video
             frame_indices = np.linspace(0, total_frames - 1, num_frames, dtype=int)
+        else:
+            max_start = total_frames - window
+            start = int(np.random.randint(0, max_start + 1)) if random_start else max_start // 2
+            frame_indices = np.arange(start, start + window, period, dtype=int)
+
+        frame_set = set(frame_indices.tolist())
+        max_needed = int(max(frame_set))
 
         frames = []
-        frame_idx_set = set(frame_indices)
         current_idx = 0
 
-        # Read frames sequentially (more efficient than seeking)
-        while len(frames) < len(frame_indices):
+        while current_idx <= max_needed:
             ret, frame = cap.read()
             if not ret:
                 break
-
-            if current_idx in frame_idx_set:
-                # Convert to grayscale and resize
+            if current_idx in frame_set:
                 if len(frame.shape) == 3:
                     frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
                 frame = cv2.resize(frame, target_size)
                 frames.append(frame)
-
             current_idx += 1
 
         cap.release()
 
-        # Pad with zeros if we didn't get enough frames
         while len(frames) < num_frames:
             frames.append(np.zeros(target_size, dtype=np.uint8))
-            print(f"Padded frame for {video_path}")
 
         return np.array(frames[:num_frames], dtype=np.float32)
 
@@ -280,6 +293,8 @@ class EchoDataset(Dataset):
         mean: float = 0.0,
         std: float = 1.0,
         target_size: Tuple[int, int] = config.target_size,
+        is_training: bool = False,
+        period: int = config.FRAME_SAMPLING_PERIOD,
     ):
         """
         Initialize EchoNet dataset.
@@ -308,6 +323,8 @@ class EchoDataset(Dataset):
         self.mean = mean
         self.std = std
         self.target_size = target_size
+        self.is_training = is_training
+        self.period = period
 
     def __len__(self) -> int:
         """Return number of videos in dataset."""
@@ -329,8 +346,11 @@ class EchoDataset(Dataset):
         video_path = self.video_paths[idx]
         ef_continuous = self.labels[idx]
 
-        # Load video frames with error handling
-        frames = load_frames_from_video(video_path, self.num_frames, self.target_size)
+        # Load frames with period-2 contiguous-window sampling (EchoNet paper)
+        frames = load_frames_from_video(
+            video_path, self.num_frames, self.target_size,
+            period=self.period, random_start=self.is_training,
+        )
 
         # Fallback to zeros if loading failed (keeps batch sizes consistent)
         if frames is None:
@@ -364,15 +384,33 @@ class EchoDataset(Dataset):
 # ==============================================================================
 # STEP 4: CREATE DATALOADERS
 # ==============================================================================
-# TODO: Apply data augmentation transforms for training (optional)
 
 
-def create_dataloaders() -> Tuple[DataLoader, DataLoader, DataLoader]:
+def _build_train_transform() -> transforms.Compose:
+    """
+    Spatial augmentation pipeline matching the EchoNet-Dynamic paper exactly.
+
+    The paper pads each 112×112 frame by 12 pixels on every side (→ 136×136)
+    then takes a random 112×112 crop, simulating small camera translations.
+    torchvision Pad and RandomCrop operate on the last two dimensions of any
+    (..., H, W) tensor, so the same crop is applied to every frame in the clip.
+    """
+    return transforms.Compose([
+        # Pad 12 px each side: 112×112 → 136×136.
+        transforms.Pad(12),
+        # Random 112×112 crop — identical crop applied to every frame.
+        transforms.RandomCrop(config.TARGET_HEIGHT),
+        # Random horizontal flip (50 % chance).
+        transforms.RandomHorizontalFlip(p=0.5),
+    ])
+
+
+def create_dataloaders() -> Tuple[DataLoader, DataLoader, DataLoader, torch.Tensor]:
     """
     Create train, validation, and test dataloaders.
 
     Returns:
-        Tuple of (train_loader, val_loader, test_loader)
+        Tuple of (train_loader, val_loader, test_loader, class_weights)
 
     Raises:
         FileNotFoundError: If dataset files not found
@@ -397,6 +435,8 @@ def create_dataloaders() -> Tuple[DataLoader, DataLoader, DataLoader]:
         labels=train_labels,
         mean=dataset_mean,
         std=dataset_std,
+        transform=_build_train_transform(),
+        is_training=True,
     )
 
     val_dataset = EchoDataset(
@@ -404,6 +444,7 @@ def create_dataloaders() -> Tuple[DataLoader, DataLoader, DataLoader]:
         labels=val_labels,
         mean=dataset_mean,
         std=dataset_std,
+        is_training=False,
     )
 
     test_dataset = EchoDataset(
@@ -411,6 +452,7 @@ def create_dataloaders() -> Tuple[DataLoader, DataLoader, DataLoader]:
         labels=test_labels,
         mean=dataset_mean,
         std=dataset_std,
+        is_training=False,
     )
 
     def build_dataloader(dataset: EchoDataset, shuffle: bool) -> DataLoader:
@@ -428,11 +470,27 @@ def create_dataloaders() -> Tuple[DataLoader, DataLoader, DataLoader]:
     val_loader = build_dataloader(val_dataset, shuffle=False)
     test_loader = build_dataloader(test_dataset, shuffle=False)
 
+    # Compute class weights from training label distribution to counter imbalance.
+    # EchoNet-Dynamic is heavily skewed toward Preserved EF (~77 %), so without
+    # weighting the classifier collapses to always predicting the majority class.
+    category_counts = Counter(convert_ef_to_category(ef) for ef in train_labels)
+    total = len(train_labels)
+    class_weights = torch.tensor(
+        [
+            total / (config.NUM_CATEGORIES * category_counts.get(i, 1))
+            for i in range(config.NUM_CATEGORIES)
+        ],
+        dtype=torch.float32,
+    )
+
     print("Dataset Summary:")
     print(f"  Train: {len(train_dataset)} videos")
     print(f"  Val:   {len(val_dataset)} videos")
     print(f"  Test:  {len(test_dataset)} videos")
     print(f"  Batch size: {config.BATCH_SIZE}")
+    print(f"  Frame sampling: {config.NUM_FRAMES} frames, period={config.FRAME_SAMPLING_PERIOD}")
     print(f"  Normalization: mean={dataset_mean:.4f}, std={dataset_std:.4f}")
+    print(f"  Class weights: {class_weights.tolist()}")
 
-    return train_loader, val_loader, test_loader
+    return train_loader, val_loader, test_loader, class_weights
+

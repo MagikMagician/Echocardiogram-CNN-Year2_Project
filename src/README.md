@@ -20,7 +20,19 @@
   - EF category label (0/1/2)
 - Creates train/val/test DataLoaders with consistent settings.
 
-## CNN + Training (CNN_model.py)
+## CNN + Training (CNN_model.py + training.py)
+
+### CNN_model.py
+- Defines a 3D CNN for echocardiogram video volumes.
+- Uses stacked Conv3D blocks for temporal-spatial feature extraction.
+- Applies adaptive pooling to support variable frame and image sizes.
+- Produces dual outputs: EF regression value and class logits.
+
+### training.py
+- Initializes device, model, losses, optimizer, and LR scheduler.
+- Runs train/validation epochs with weighted multi-task loss.
+- Tracks loss, MAE, and classification accuracy per epoch.
+- Saves the best checkpoint and uses early stopping.
 
 
 ## Analysis (analysis.py)
@@ -29,8 +41,9 @@
 ## Minimal Progress Checklist
 - [x] Data loading + preprocessing
 - [x] Dataset + DataLoaders
-- [ ] CNN architecture
-- [ ] Training loop
-- [ ] Test evaluation
-- [ ] Grad-CAM
-- [ ] Ablation study
+- [x] Data augmentation (horizontal flip, random affine for training)
+- [x] CNN architecture
+- [x] Training loop
+- [x] Test evaluation (MAE, RMSE, R², accuracy, ROC-AUC, confusion matrix, scatter plot)
+- [x] Grad-CAM visualizations
+- [x] Ablation study (frame count, loss weight variants)

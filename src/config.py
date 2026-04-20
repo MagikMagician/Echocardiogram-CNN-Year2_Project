@@ -8,7 +8,6 @@ LOCAL_CONFIG_FILE = Path("local_config.json")
 def load_local_config(config_path: Path = LOCAL_CONFIG_FILE) -> dict:
     """Load optional local overrides for person-specific settings."""
     if not config_path.exists():
-        print(f"Local config file not found at {config_path}. Using default settings.")
         return {}
 
     try:
@@ -37,11 +36,12 @@ class Config:
     VIDEO_EXTENSION = ".avi"
 
     # Model hyperparameters
-    NUM_FRAMES = 16  # Number of frames to sample per video
-    TARGET_HEIGHT = 112  # Frame height after resize
-    TARGET_WIDTH = 112  # Frame width after resize
-    BATCH_SIZE = 4  # Batch size for DataLoader
-    NUM_WORKERS = 0  # Number of workers for DataLoader (0 for OpenCV compatibility)
+    NUM_FRAMES = 32           # Number of frames to sample per video (EchoNet paper: 32)
+    TARGET_HEIGHT = 112       # Frame height after resize
+    TARGET_WIDTH = 112        # Frame width after resize
+    BATCH_SIZE = 16           # Batch size for DataLoader
+    NUM_WORKERS = 4           # Number of workers for DataLoader
+    FRAME_SAMPLING_PERIOD = 2 # Sample every Nth frame (paper: 2 → 32 frames from 64-frame window)
 
     # EF Categories
     EF_REDUCED_THRESHOLD = 40.0  # EF < 40% = Reduced
@@ -55,8 +55,8 @@ class Config:
     DEFAULT_STD = 0.5
 
     # Training hyperparameters
-    LEARNING_RATE = 1e-4
-    NUM_EPOCHS = 50
+    LEARNING_RATE = 1e-4      # Scaled with batch size (linear scaling rule: 2× batch → 2× LR)
+    NUM_EPOCHS = 45  # EchoNet paper trains for 45 epochs
     PATIENCE = 10  # Early stopping patience
 
     @property
