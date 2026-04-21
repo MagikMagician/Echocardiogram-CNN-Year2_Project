@@ -2,6 +2,7 @@ import os
 import json
 import time
 import sys
+import csv
 from pathlib import Path
 from tkinter import filedialog
 
@@ -26,7 +27,7 @@ import numpy as np
 from PIL import Image
 
 VIDEO_FILETYPES = [("Video Files", "*.mp4 *.avi *.mov *.mkv *.wmv"), ("All Files", "*.*")]
-CATEGORY_NAMES = ["Reduced", "Mildly Reduced", "Preserved"]
+CATEGORY_NAMES = ["Reduced (<40%)", "Mildly Reduced (40-49%)", "Preserved (≥50%)"]
 
 
 class App(ctk.CTk):
@@ -90,12 +91,18 @@ class App(ctk.CTk):
 		self.run_btn = ctk.CTkButton(right_panel, text="Predict EF", command=self.run_inference)
 		self.run_btn.pack(fill="x", padx=10, pady=(10, 8))
 
-		self.gradcam_btn = ctk.CTkButton(right_panel, text="Generate Grad-CAM Video", command=self.generate_gradcam_video)
-		self.gradcam_btn.pack(fill="x", padx=10, pady=(0, 8))
-
 		self.result_text = ctk.CTkTextbox(right_panel)
 		self.result_text.pack(fill="both", expand=True, padx=10, pady=(0, 10))
 		self.result_text.configure(state="disabled")
+
+		bottom_actions = ctk.CTkFrame(right_panel, fg_color="transparent")
+		bottom_actions.pack(fill="x", padx=10, pady=(0, 10))
+
+		self.gradcam_btn = ctk.CTkButton(bottom_actions, text="Generate Grad-CAM", command=self.generate_gradcam_video)
+		self.gradcam_btn.pack(side="left", fill="x", expand=True, padx=(0, 6))
+
+		self.true_ef_btn = ctk.CTkButton(bottom_actions, text="Get True EF", command=self.lookup_true_ef)
+		self.true_ef_btn.pack(side="right", fill="x", expand=True)
 
 	def pick_path(self) -> None:
 		folder = filedialog.askdirectory(initialdir=str(self.model_folder))
@@ -237,30 +244,73 @@ class App(ctk.CTk):
 				overlay = cv2.addWeighted(frame_bgr, 0.60, heatmap, 0.40, 0.0)
 				overlay_frames_rgb.append(cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB))
 
-			out_dir = BASE_DIR / "artifacts" / "gradcam"
-			out_dir.mkdir(parents=True, exist_ok=True)
-			out_path = out_dir / "last_run_gradcam.mp4"
-			fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-			writer = cv2.VideoWriter(str(out_path), fourcc, max(fps, 1.0), (full_frames_bgr[0].shape[1], full_frames_bgr[0].shape[0]))
-			for frame_rgb in overlay_frames_rgb:
-				writer.write(cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR))
-			writer.release()
-
 			self._start_preview_frames(overlay_frames_rgb, fps)
-			self._set_results(
-				"Grad-CAM video generated and loaded in preview.\n"
-				f"Saved: {out_path}"
-			)
+			self._set_results("Grad-CAM video generated and loaded in preview.")
 		except Exception as exc:
 			self._set_results(f"Grad-CAM failed:\n{exc}")
 		finally:
-			self.gradcam_btn.configure(state="normal", text="Generate Grad-CAM Video")
+			self.gradcam_btn.configure(state="normal", text="Generate Grad-CAM")
 
 	def _set_results(self, text: str) -> None:
 		self.result_text.configure(state="normal")
 		self.result_text.delete("1.0", "end")
 		self.result_text.insert("1.0", text)
 		self.result_text.configure(state="disabled")
+
+	def lookup_true_ef(self) -> None:
+		if not self.selected_video_path:
+			self._set_results("Please select a video first.")
+			return
+
+		video_path = Path(self.selected_video_path)
+		csv_path = video_path.parent.parent / "FileList.csv"
+		if not csv_path.exists():
+			csv_path = video_path.parent / "FileList.csv"
+		if not csv_path.exists():
+			picked = filedialog.askopenfilename(
+				title="Select FileList.csv",
+				filetypes=[("CSV Files", "*.csv"), ("All Files", "*.*")],
+			)
+			if not picked:
+				self._set_results("FileList.csv not found automatically and no CSV was selected.")
+				return
+			csv_path = Path(picked)
+
+		target_stem = video_path.stem.lower()
+		target_name = video_path.name.lower()
+
+		try:
+			with csv_path.open("r", encoding="utf-8-sig", newline="") as f:
+				reader = csv.DictReader(f)
+				if not reader.fieldnames or "FileName" not in reader.fieldnames or "EF" not in reader.fieldnames:
+					self._set_results(f"CSV missing required columns FileName/EF:\n{csv_path}")
+					return
+
+				for row in reader:
+					file_name = str(row.get("FileName", "")).strip()
+					if not file_name:
+						continue
+					candidates = {
+						file_name.lower(),
+						Path(file_name).name.lower(),
+						Path(file_name).stem.lower(),
+					}
+					if target_stem in candidates or target_name in candidates:
+						ef_val = str(row.get("EF", "")).strip()
+						if not ef_val:
+							self._set_results(f"Found video in CSV but EF is empty.\nCSV: {csv_path}")
+							return
+						self._set_results(
+							f"True EF found\n\nVideo: {video_path.name}\nEF: {ef_val}\nCSV: {csv_path}"
+						)
+						return
+		except Exception as exc:
+			self._set_results(f"Failed to read CSV:\n{exc}")
+			return
+
+		self._set_results(
+			f"No matching FileName found for video: {video_path.name}\nCSV: {csv_path}"
+		)
 
 	def _load_stats(self) -> tuple[float, float]:
 		stats_path = BASE_DIR / self.cfg.STATS_CACHE_FILE
@@ -341,11 +391,6 @@ class App(ctk.CTk):
 			duration = (frame_count / fps) if fps > 0 else 0.0
 
 			result_lines = [
-				"Inference complete",
-				"",
-				f"Model: {Path(self.selected_checkpoint_path).name}",
-				f"Video: {Path(self.selected_video_path).name}",
-				"",
 				f"Predicted EF: {pred_ef:.2f}%",
 				f"Classification: {pred_class}",
 				f"Confidence: {pred_conf * 100:.2f}%",
