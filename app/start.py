@@ -29,15 +29,13 @@ from PIL import Image
 VIDEO_FILETYPES = [("Video Files", "*.mp4 *.avi *.mov *.mkv *.wmv"), ("All Files", "*.*")]
 CATEGORY_NAMES = ["Reduced (<40%)", "Mildly Reduced (40-49%)", "Preserved (≥50%)"]
 
-
 class App(ctk.CTk):
 	def __init__(self) -> None:
 		super().__init__()
 		self.cfg = Config()
-		self.title("CustomTkinter App")
-		self.geometry("800x500")
-		self.artifacts_dir = str(BASE_DIR / "artifacts")
-		self.model_folder = Path(self.artifacts_dir)
+		self.title("Ejection Fraction Predictor")
+		self.geometry("870x500")
+		self.model_folder = BASE_DIR / "artifacts"
 		self.selected_checkpoint_path = ""
 		self.selected_video_path = ""
 		self.video_capture = None
@@ -48,6 +46,12 @@ class App(ctk.CTk):
 		self.next_frame_time = 0.0
 		self._video_image = None
 		self.inference_busy = False
+		self.last_predicted_ef: float | None = None
+		self.last_predicted_classification: str | None = None
+		self.last_pred_confidence: float | None = None
+		self.last_pred_margin: float | None = None
+		self.last_true_ef: float | None = None
+		self.last_true_classification: str | None = None
 		self.protocol("WM_DELETE_WINDOW", self.on_close)
 
 		top_bar = ctk.CTkFrame(self, fg_color="transparent")
@@ -87,13 +91,28 @@ class App(ctk.CTk):
 
 		right_panel = ctk.CTkFrame(self)
 		right_panel.place(relx=0.52, rely=0.1, relwidth=0.46, relheight=0.85, anchor="nw")
-
 		self.run_btn = ctk.CTkButton(right_panel, text="Predict EF", command=self.run_inference)
 		self.run_btn.pack(fill="x", padx=10, pady=(10, 8))
 
-		self.result_text = ctk.CTkTextbox(right_panel)
-		self.result_text.pack(fill="both", expand=True, padx=10, pady=(0, 10))
-		self.result_text.configure(state="disabled")
+		self.error_banner = ctk.CTkLabel(right_panel, text="", anchor="w", wraplength=340, text_color="red")
+
+		self.output_panel = ctk.CTkFrame(right_panel, fg_color="transparent")
+		self.output_panel.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+
+		self._section_header(self.output_panel, "Results")
+		self.pred_ef_value, self.pred_ef_quality = self._value_row_with_indicator(self.output_panel, "Predicted EF")
+		self.classification_value, self.classification_quality = self._value_row_with_indicator(self.output_panel, "Classification")
+		self.confidence_value, self.confidence_quality = self._value_row_with_indicator(self.output_panel, "Confidence")
+		self.margin_value, self.margin_quality = self._value_row_with_indicator(self.output_panel, "Confidence Margin")
+
+		self._section_header(self.output_panel, "Processing Statistics")
+		self.inference_time_value = self._value_row(self.output_panel, "Inference Time")
+		self.data_quality_value = self._value_row(self.output_panel, "Data Quality")
+		self.video_meta_value = self._value_row(self.output_panel, "Video")
+
+		self._section_header(self.output_panel, "True EF")
+		self.true_ef_value, self.true_ef_delta_value = self._true_ef_row(self.output_panel, "True EF")
+		self.true_ef_classification_value, self.true_ef_class_match_value = self._value_row_with_indicator(self.output_panel, "Classification")
 
 		bottom_actions = ctk.CTkFrame(right_panel, fg_color="transparent")
 		bottom_actions.pack(fill="x", padx=10, pady=(0, 10))
@@ -104,13 +123,152 @@ class App(ctk.CTk):
 		self.true_ef_btn = ctk.CTkButton(bottom_actions, text="Get True EF", command=self.lookup_true_ef)
 		self.true_ef_btn.pack(side="right", fill="x", expand=True)
 
+	def _section_header(self, parent: ctk.CTkFrame, title: str) -> None:
+		self._section_divider(parent, pady=(5, 0))
+		label = ctk.CTkLabel(parent, text=title, font=ctk.CTkFont(weight="bold"))
+		label.pack(pady=0)
+		self._section_divider(parent, pady=(0, 3))
+
+	def _section_divider(self, parent: ctk.CTkFrame, pady = 0) -> None:
+		divider = ctk.CTkFrame(parent, height=2, fg_color="gray30")
+		divider.pack(fill="x", padx=10, pady=pady)
+
+	def _value_row(self, parent: ctk.CTkFrame, key: str) -> ctk.CTkLabel:
+		row = ctk.CTkFrame(parent, fg_color="transparent")
+		row.pack(fill="x", padx=10, pady=0)
+		key_label = ctk.CTkLabel(row, text=f"{key}:", width=130, height=20, anchor="w")
+		key_label.pack(side="left")
+		value_label = ctk.CTkLabel(row, text="-", height=20, anchor="w", justify="left")
+		value_label.pack(side="left", fill="x", expand=True)
+		return value_label
+
+	def _value_row_with_indicator(self, parent: ctk.CTkFrame, key: str) -> tuple[ctk.CTkLabel, ctk.CTkLabel]:
+		row = ctk.CTkFrame(parent, fg_color="transparent")
+		row.pack(fill="x", padx=10, pady=0)
+		key_label = ctk.CTkLabel(row, text=f"{key}:", width=130, height=20, anchor="w")
+		key_label.pack(side="left")
+		value_label = ctk.CTkLabel(row, text="-", height=20, anchor="w", justify="left")
+		value_label.pack(side="left", fill="x", expand=True)
+		indicator_label = ctk.CTkLabel(row, text="-", width=24, height=20, anchor="e", text_color="gray70")
+		indicator_label.pack(side="right")
+		return value_label, indicator_label
+
+	def _true_ef_row(self, parent: ctk.CTkFrame, key: str) -> tuple[ctk.CTkLabel, ctk.CTkLabel]:
+		row = ctk.CTkFrame(parent, fg_color="transparent")
+		row.pack(fill="x", padx=10, pady=0)
+		key_label = ctk.CTkLabel(row, text=f"{key}:", width=130, height=20, anchor="w")
+		key_label.pack(side="left")
+		value_label = ctk.CTkLabel(row, text="-", height=20, anchor="w", justify="left")
+		value_label.pack(side="left", fill="x", expand=True)
+		delta_label = ctk.CTkLabel(row, text="-", width=85, height=20, anchor="e", justify="right", text_color="gray70")
+		delta_label.pack(side="right")
+		return value_label, delta_label
+
+	def _update_true_ef_comparison(self) -> None:
+		if self.last_true_ef is None or self.last_predicted_ef is None:
+			self.true_ef_delta_value.configure(text="-", text_color="gray70")
+			self.true_ef_class_match_value.configure(text="-", text_color="gray70")
+			return
+
+		diff = self.last_predicted_ef - self.last_true_ef
+		if diff > 0:
+			arrow = "▲"
+		elif diff < 0:
+			arrow = "▼"
+		else:
+			arrow = "="
+		diff_abs = abs(diff)
+		if diff_abs <= 3.0:
+			delta_color = "#22c55e"
+		elif diff_abs <= 10.0:
+			delta_color = "#f59e0b"
+		else:
+			delta_color = "#ef4444"
+		self.true_ef_delta_value.configure(text=f"{arrow} {diff_abs:.2f}%", text_color=delta_color)
+
+		if self.last_predicted_classification is None or self.last_true_classification is None:
+			self.true_ef_class_match_value.configure(text="-", text_color="gray70")
+			return
+
+		is_match = self.last_predicted_classification == self.last_true_classification
+		self.true_ef_class_match_value.configure(text="✔" if is_match else "❌", text_color="#22c55e" if is_match else "#ef4444")
+
+	def _set_quality_circle(self, label: ctk.CTkLabel, level: str | None) -> None:
+		if level == "good":
+			label.configure(text="●", text_color="#22c55e")
+		elif level == "okay":
+			label.configure(text="●", text_color="#f59e0b")
+		elif level == "poor":
+			label.configure(text="●", text_color="#ef4444")
+		else:
+			label.configure(text="-", text_color="gray70")
+
+	def _score_probability(self, probability: float | None) -> str | None:
+		if probability is None:
+			return None
+		if probability >= 0.35:
+			return "good"
+		if probability >= 0.12:
+			return "okay"
+		return "poor"
+
+	def _score_margin(self, margin: float | None) -> str | None:
+		if margin is None:
+			return None
+		if margin >= 0.30:
+			return "good"
+		if margin >= 0.15:
+			return "okay"
+		return "poor"
+
+	def _score_ef_band(self, ef_value: float | None) -> str | None:
+		if ef_value is None:
+			return None
+		if ef_value >= 50.0:
+			return "good"
+		if ef_value >= 40.0:
+			return "okay"
+		return "poor"
+
+	def _score_classification_band(self, classification: str | None) -> str | None:
+		if classification is None:
+			return None
+		if classification == CATEGORY_NAMES[2]:
+			return "good"
+		if classification == CATEGORY_NAMES[1]:
+			return "okay"
+		if classification == CATEGORY_NAMES[0]:
+			return "poor"
+		return None
+
+	def _update_result_quality_indicators(self) -> None:
+		self._set_quality_circle(
+			self.pred_ef_quality,
+			self._score_ef_band(self.last_predicted_ef),
+		)
+		self._set_quality_circle(
+			self.classification_quality,
+			self._score_classification_band(self.last_predicted_classification),
+		)
+		self._set_quality_circle(self.confidence_quality, self._score_probability(self.last_pred_confidence))
+		self._set_quality_circle(self.margin_quality, self._score_margin(self.last_pred_margin))
+
+	def _set_error(self, message: str) -> None:
+		if message:
+			self.error_banner.configure(text=message)
+			if self.error_banner.winfo_manager() == "":
+				self.error_banner.pack(after=self.run_btn, fill="x", padx=10, pady=0)
+		else:
+			if self.error_banner.winfo_manager() != "":
+				self.error_banner.pack_forget()
+
 	def pick_path(self) -> None:
 		folder = filedialog.askdirectory(initialdir=str(self.model_folder))
 		if folder:
 			self.model_folder = Path(folder)
 			self._refresh_model_dropdown(self.model_folder)
 
-	def _refresh_model_dropdown(self, folder: Path, selected_name: str | None = None) -> None:
+	def _refresh_model_dropdown(self, folder: Path) -> None:
 		pt_files = sorted(folder.glob("*.pt"))
 		if not pt_files:
 			self.model_dropdown.configure(values=["No .pt files found"])
@@ -120,7 +278,7 @@ class App(ctk.CTk):
 
 		file_names = [p.name for p in pt_files]
 		self.model_dropdown.configure(values=file_names)
-		choice = selected_name if selected_name in file_names else file_names[0]
+		choice = file_names[0]
 		self.model_dropdown.set(choice)
 		self._on_model_selected(choice)
 
@@ -136,6 +294,20 @@ class App(ctk.CTk):
 		)
 		if path:
 			self.selected_video_path = path
+			self.last_predicted_ef = None
+			self.last_predicted_classification = None
+			self.last_pred_confidence = None
+			self.last_pred_margin = None
+			self.last_true_ef = None
+			self.last_true_classification = None
+			self.pred_ef_value.configure(text="-")
+			self.classification_value.configure(text="-")
+			self.confidence_value.configure(text="-")
+			self.margin_value.configure(text="-")
+			self.true_ef_value.configure(text="-")
+			self.true_ef_classification_value.configure(text="-")
+			self._update_result_quality_indicators()
+			self._update_true_ef_comparison()
 			self.video_name.configure(text=Path(path).name)
 			self.start_video(path)
 
@@ -190,10 +362,10 @@ class App(ctk.CTk):
 
 	def generate_gradcam_video(self) -> None:
 		if not self.selected_checkpoint_path:
-			self._set_results("Please select a model checkpoint (.pt) first.")
+			self._set_error("Please select a model checkpoint (.pt) first.")
 			return
 		if not self.selected_video_path:
-			self._set_results("Please select a video first.")
+			self._set_error("Please select a video first.")
 			return
 
 		self.gradcam_btn.configure(state="disabled", text="Generating...")
@@ -210,7 +382,7 @@ class App(ctk.CTk):
 			cap.release()
 
 			if not full_frames_bgr:
-				self._set_results("Grad-CAM failed: no frames found in video.")
+				self._set_error("Grad-CAM failed: no frames found in video.")
 				return
 
 			small_gray_frames = [
@@ -226,10 +398,7 @@ class App(ctk.CTk):
 			clip = (clip - mean) / std
 			input_tensor = torch.from_numpy(clip).unsqueeze(0).unsqueeze(0).float()
 
-			components = initialize_training_components(class_weights=None)
-			checkpoint = torch.load(self.selected_checkpoint_path, map_location=components.device)
-			components.model.load_state_dict(checkpoint["model_state_dict"])
-			components.model.eval()
+			components = self._load_selected_model_components()
 
 			video_device = input_tensor.to(components.device, non_blocking=True)
 			cam = self._compute_gradcam(components.model, video_device)
@@ -245,21 +414,38 @@ class App(ctk.CTk):
 				overlay_frames_rgb.append(cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB))
 
 			self._start_preview_frames(overlay_frames_rgb, fps)
-			self._set_results("Grad-CAM video generated and loaded in preview.")
 		except Exception as exc:
-			self._set_results(f"Grad-CAM failed:\n{exc}")
+			self._set_error(f"Grad-CAM failed:\n{exc}")
 		finally:
 			self.gradcam_btn.configure(state="normal", text="Generate Grad-CAM")
 
-	def _set_results(self, text: str) -> None:
-		self.result_text.configure(state="normal")
-		self.result_text.delete("1.0", "end")
-		self.result_text.insert("1.0", text)
-		self.result_text.configure(state="disabled")
+	def _load_selected_model_components(self):
+		components = initialize_training_components(class_weights=None)
+		checkpoint = torch.load(self.selected_checkpoint_path, map_location=components.device)
+		components.model.load_state_dict(checkpoint["model_state_dict"])
+		components.model.eval()
+		return components
+
+	def _video_metadata(self, video_path: str) -> tuple[float, int, int, int, float]:
+		cap = cv2.VideoCapture(video_path)
+		fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+		frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+		width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+		height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+		cap.release()
+		duration = (frame_count / fps) if fps > 0 else 0.0
+		return fps, frame_count, width, height, duration
+
+	def _classify_ef_value(self, ef_value: float) -> str:
+		if ef_value < 40.0:
+			return CATEGORY_NAMES[0]
+		if ef_value < 50.0:
+			return CATEGORY_NAMES[1]
+		return CATEGORY_NAMES[2]
 
 	def lookup_true_ef(self) -> None:
 		if not self.selected_video_path:
-			self._set_results("Please select a video first.")
+			self._set_error("Please select a video first.")
 			return
 
 		video_path = Path(self.selected_video_path)
@@ -272,7 +458,7 @@ class App(ctk.CTk):
 				filetypes=[("CSV Files", "*.csv"), ("All Files", "*.*")],
 			)
 			if not picked:
-				self._set_results("FileList.csv not found automatically and no CSV was selected.")
+				self._set_error("FileList.csv not found automatically and no CSV was selected.")
 				return
 			csv_path = Path(picked)
 
@@ -283,7 +469,7 @@ class App(ctk.CTk):
 			with csv_path.open("r", encoding="utf-8-sig", newline="") as f:
 				reader = csv.DictReader(f)
 				if not reader.fieldnames or "FileName" not in reader.fieldnames or "EF" not in reader.fieldnames:
-					self._set_results(f"CSV missing required columns FileName/EF:\n{csv_path}")
+					self._set_error(f"CSV missing required columns FileName/EF:\n{csv_path}")
 					return
 
 				for row in reader:
@@ -298,17 +484,27 @@ class App(ctk.CTk):
 					if target_stem in candidates or target_name in candidates:
 						ef_val = str(row.get("EF", "")).strip()
 						if not ef_val:
-							self._set_results(f"Found video in CSV but EF is empty.\nCSV: {csv_path}")
+							self._set_error(f"Found video in CSV but EF is empty.\nCSV: {csv_path}")
 							return
-						self._set_results(
-							f"True EF found\n\nVideo: {video_path.name}\nEF: {ef_val}\nCSV: {csv_path}"
-						)
+						try:
+							ef_float = float(ef_val)
+						except ValueError:
+							self._set_error(f"Found EF value is not numeric: '{ef_val}'.\nCSV: {csv_path}")
+							return
+
+						self.true_ef_value.configure(text=f"{ef_float:.2f}%")
+						true_class = self._classify_ef_value(ef_float)
+						self.true_ef_classification_value.configure(text=true_class)
+						self.last_true_ef = ef_float
+						self.last_true_classification = true_class
+						self._update_true_ef_comparison()
+						self._set_error("")
 						return
 		except Exception as exc:
-			self._set_results(f"Failed to read CSV:\n{exc}")
+			self._set_error(f"Failed to read CSV:\n{exc}")
 			return
 
-		self._set_results(
+		self._set_error(
 			f"No matching FileName found for video: {video_path.name}\nCSV: {csv_path}"
 		)
 
@@ -328,7 +524,27 @@ class App(ctk.CTk):
 			std = self.cfg.DEFAULT_STD
 		return mean, std
 
-	def _prepare_video_tensor(self, video_path: str) -> torch.Tensor | None:
+	def _compute_data_quality(self, frames: np.ndarray) -> str:
+		total = int(frames.shape[0]) if frames.ndim >= 1 else 0
+		if total <= 0:
+			return "Unknown"
+
+		# Padding in load_frames_from_video is zero-filled frames.
+		usable_mask = np.any(frames != 0, axis=(1, 2))
+		usable = int(np.sum(usable_mask))
+		padded = total - usable
+		usable_pct = (usable / total) * 100.0
+
+		if padded == 0:
+			label = "Good"
+		elif usable_pct >= 85.0:
+			label = "Okay"
+		else:
+			label = "Poor"
+
+		return f"{label} ({usable}/{total} usable, {padded} padded)"
+
+	def _prepare_video_tensor(self, video_path: str) -> tuple[torch.Tensor, str] | None:
 		frames = load_frames_from_video(
 			video_path=video_path,
 			num_frames=self.cfg.NUM_FRAMES,
@@ -338,19 +554,21 @@ class App(ctk.CTk):
 		)
 		if frames is None:
 			return None
+		data_quality = self._compute_data_quality(frames)
 		mean, std = self._load_stats()
 		frames = frames.astype(np.float32) / 255.0
 		frames = (frames - mean) / std
-		return torch.from_numpy(frames).unsqueeze(0).unsqueeze(0).float()
+		video_tensor = torch.from_numpy(frames).unsqueeze(0).unsqueeze(0).float()
+		return video_tensor, data_quality
 
 	def run_inference(self) -> None:
 		if self.inference_busy:
 			return
 		if not self.selected_checkpoint_path:
-			self._set_results("Please select a model checkpoint (.pt) first.")
+			self._set_error("Please select a model checkpoint (.pt) first.")
 			return
 		if not self.selected_video_path:
-			self._set_results("Please select a video first.")
+			self._set_error("Please select a video first.")
 			return
 
 		self.inference_busy = True
@@ -358,15 +576,13 @@ class App(ctk.CTk):
 		self.update_idletasks()
 
 		try:
-			input_tensor = self._prepare_video_tensor(self.selected_video_path)
-			if input_tensor is None:
-				self._set_results("Could not read enough frames from the selected video.")
+			prepared = self._prepare_video_tensor(self.selected_video_path)
+			if prepared is None:
+				self._set_error("Could not read enough frames from the selected video.")
 				return
+			input_tensor, data_quality_text = prepared
 
-			components = initialize_training_components(class_weights=None)
-			checkpoint = torch.load(self.selected_checkpoint_path, map_location=components.device)
-			components.model.load_state_dict(checkpoint["model_state_dict"])
-			components.model.eval()
+			components = self._load_selected_model_components()
 
 			video_device = input_tensor.to(components.device, non_blocking=True)
 			start = time.perf_counter()
@@ -382,27 +598,23 @@ class App(ctk.CTk):
 			sorted_probs = np.sort(probs)
 			margin = float(sorted_probs[-1] - sorted_probs[-2]) if len(sorted_probs) > 1 else 0.0
 
-			cap = cv2.VideoCapture(self.selected_video_path)
-			fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
-			frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-			width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
-			height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
-			cap.release()
-			duration = (frame_count / fps) if fps > 0 else 0.0
-
-			result_lines = [
-				f"Predicted EF: {pred_ef:.2f}%",
-				f"Classification: {pred_class}",
-				f"Confidence: {pred_conf * 100:.2f}%",
-				f"Confidence margin (top1-top2): {margin * 100:.2f}%",
-				"",
-				f"Inference time: {inference_ms:.1f} ms",
-				f"Input clip: {self.cfg.NUM_FRAMES} frames @ period {self.cfg.FRAME_SAMPLING_PERIOD}",
-				f"Original video: {width}x{height}, {fps:.2f} FPS, {frame_count} frames, {duration:.2f}s",
-			]
-			self._set_results("\n".join(result_lines))
+			fps, frame_count, width, height, duration = self._video_metadata(self.selected_video_path)
+			self.pred_ef_value.configure(text=f"{pred_ef:.2f}%")
+			self.classification_value.configure(text=pred_class)
+			self.confidence_value.configure(text=f"{pred_conf * 100:.2f}%")
+			self.margin_value.configure(text=f"{margin * 100:.2f}%")
+			self.inference_time_value.configure(text=f"{inference_ms:.1f} ms")
+			self.data_quality_value.configure(text=data_quality_text)
+			self.video_meta_value.configure(text=f"{width}x{height}, {fps:.2f} FPS, {frame_count} frames, {duration:.2f}s")
+			self.last_predicted_ef = pred_ef
+			self.last_predicted_classification = pred_class
+			self.last_pred_confidence = pred_conf
+			self.last_pred_margin = margin
+			self._update_result_quality_indicators()
+			self._update_true_ef_comparison()
+			self._set_error("")
 		except Exception as exc:
-			self._set_results(f"Inference failed:\n{exc}")
+			self._set_error(f"Inference failed:\n{exc}")
 		finally:
 			self.inference_busy = False
 			self.run_btn.configure(state="normal", text="Predict EF")
