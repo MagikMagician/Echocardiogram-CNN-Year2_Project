@@ -3,8 +3,10 @@ import json
 import time
 import sys
 import csv
+import threading
 from pathlib import Path
 from tkinter import filedialog
+from queue import Queue, Empty
 
 BASE_DIR = Path(__file__).resolve().parents[1]
 if str(BASE_DIR) not in sys.path:
@@ -28,6 +30,14 @@ from PIL import Image
 
 VIDEO_FILETYPES = [("Video Files", "*.mp4 *.avi *.mov *.mkv *.wmv"), ("All Files", "*.*")]
 CATEGORY_NAMES = ["Reduced (<40%)", "Mildly Reduced (40-49%)", "Preserved (≥50%)"]
+QUALITY_COLORS = {"good": "#22c55e", "okay": "#f59e0b", "poor": "#ef4444"}
+ROW_HEIGHT = 20
+INDICATOR_WIDTH = 24
+TRUE_EF_DELTA_WIDTH = 85
+GRADCAM_DEFAULT_FPS = 30.0
+GRADCAM_GENERATE_TEXT = "Generate Grad-CAM"
+GRADCAM_EXPORT_TEXT = "Export Grad-CAM"
+GRADCAM_POLL_INTERVAL_MS = 500
 
 class App(ctk.CTk):
 	def __init__(self) -> None:
@@ -52,6 +62,13 @@ class App(ctk.CTk):
 		self.last_pred_margin: float | None = None
 		self.last_true_ef: float | None = None
 		self.last_true_classification: str | None = None
+		self.gradcam_thread: threading.Thread | None = None
+		self.gradcam_poll_after_id = None
+		self.gradcam_spinner_step = 0
+		self.gradcam_queue: Queue = Queue()
+		self.gradcam_frames: list[np.ndarray] | None = None
+		self.gradcam_fps = GRADCAM_DEFAULT_FPS
+		self.gradcam_source_video_path = ""
 		self.protocol("WM_DELETE_WINDOW", self.on_close)
 
 		top_bar = ctk.CTkFrame(self, fg_color="transparent")
@@ -106,7 +123,7 @@ class App(ctk.CTk):
 		self.margin_value, self.margin_quality = self._value_row_with_indicator(self.output_panel, "Confidence Margin")
 
 		self._section_header(self.output_panel, "Processing Statistics")
-		self.inference_time_value = self._value_row(self.output_panel, "Inference Time")
+		self.inference_time_value = self._value_row(self.output_panel, "Prediction Time")
 		self.data_quality_value = self._value_row(self.output_panel, "Data Quality")
 		self.video_meta_value = self._value_row(self.output_panel, "Video")
 
@@ -117,7 +134,7 @@ class App(ctk.CTk):
 		bottom_actions = ctk.CTkFrame(right_panel, fg_color="transparent")
 		bottom_actions.pack(fill="x", padx=10, pady=(0, 10))
 
-		self.gradcam_btn = ctk.CTkButton(bottom_actions, text="Generate Grad-CAM", command=self.generate_gradcam_video)
+		self.gradcam_btn = ctk.CTkButton(bottom_actions, text=GRADCAM_GENERATE_TEXT, command=self.generate_gradcam_video)
 		self.gradcam_btn.pack(side="left", fill="x", expand=True, padx=(0, 6))
 
 		self.true_ef_btn = ctk.CTkButton(bottom_actions, text="Get True EF", command=self.lookup_true_ef)
@@ -134,34 +151,31 @@ class App(ctk.CTk):
 		divider.pack(fill="x", padx=10, pady=pady)
 
 	def _value_row(self, parent: ctk.CTkFrame, key: str) -> ctk.CTkLabel:
-		row = ctk.CTkFrame(parent, fg_color="transparent")
-		row.pack(fill="x", padx=10, pady=0)
-		key_label = ctk.CTkLabel(row, text=f"{key}:", width=130, height=20, anchor="w")
-		key_label.pack(side="left")
-		value_label = ctk.CTkLabel(row, text="-", height=20, anchor="w", justify="left")
-		value_label.pack(side="left", fill="x", expand=True)
+		value_label, _ = self._build_value_row(parent, key)
 		return value_label
 
-	def _value_row_with_indicator(self, parent: ctk.CTkFrame, key: str) -> tuple[ctk.CTkLabel, ctk.CTkLabel]:
+	def _build_value_row(self, parent: ctk.CTkFrame, key: str, right_widths: tuple[int, ...] = ()) -> tuple[ctk.CTkLabel, tuple[ctk.CTkLabel, ...]]:
 		row = ctk.CTkFrame(parent, fg_color="transparent")
 		row.pack(fill="x", padx=10, pady=0)
-		key_label = ctk.CTkLabel(row, text=f"{key}:", width=130, height=20, anchor="w")
+		key_label = ctk.CTkLabel(row, text=f"{key}:", width=130, height=ROW_HEIGHT, anchor="w")
 		key_label.pack(side="left")
-		value_label = ctk.CTkLabel(row, text="-", height=20, anchor="w", justify="left")
+		value_label = ctk.CTkLabel(row, text="-", height=ROW_HEIGHT, anchor="w", justify="left")
 		value_label.pack(side="left", fill="x", expand=True)
-		indicator_label = ctk.CTkLabel(row, text="-", width=24, height=20, anchor="e", text_color="gray70")
-		indicator_label.pack(side="right")
-		return value_label, indicator_label
+		right_labels: list[ctk.CTkLabel] = []
+		for width in right_widths:
+			right_label = ctk.CTkLabel(row, text="-", width=width, height=ROW_HEIGHT, anchor="e", text_color="gray70")
+			right_label.pack(side="right")
+			right_labels.append(right_label)
+		return value_label, tuple(right_labels)
+
+	def _value_row_with_indicator(self, parent: ctk.CTkFrame, key: str) -> tuple[ctk.CTkLabel, ctk.CTkLabel]:
+		value_label, right_labels = self._build_value_row(parent, key, right_widths=(INDICATOR_WIDTH,))
+		return value_label, right_labels[0]
 
 	def _true_ef_row(self, parent: ctk.CTkFrame, key: str) -> tuple[ctk.CTkLabel, ctk.CTkLabel]:
-		row = ctk.CTkFrame(parent, fg_color="transparent")
-		row.pack(fill="x", padx=10, pady=0)
-		key_label = ctk.CTkLabel(row, text=f"{key}:", width=130, height=20, anchor="w")
-		key_label.pack(side="left")
-		value_label = ctk.CTkLabel(row, text="-", height=20, anchor="w", justify="left")
-		value_label.pack(side="left", fill="x", expand=True)
-		delta_label = ctk.CTkLabel(row, text="-", width=85, height=20, anchor="e", justify="right", text_color="gray70")
-		delta_label.pack(side="right")
+		value_label, right_labels = self._build_value_row(parent, key, right_widths=(TRUE_EF_DELTA_WIDTH,))
+		delta_label = right_labels[0]
+		delta_label.configure(justify="right")
 		return value_label, delta_label
 
 	def _update_true_ef_comparison(self) -> None:
@@ -194,41 +208,28 @@ class App(ctk.CTk):
 		self.true_ef_class_match_value.configure(text="✔" if is_match else "❌", text_color="#22c55e" if is_match else "#ef4444")
 
 	def _set_quality_circle(self, label: ctk.CTkLabel, level: str | None) -> None:
-		if level == "good":
-			label.configure(text="●", text_color="#22c55e")
-		elif level == "okay":
-			label.configure(text="●", text_color="#f59e0b")
-		elif level == "poor":
-			label.configure(text="●", text_color="#ef4444")
+		if level in QUALITY_COLORS:
+			label.configure(text="●", text_color=QUALITY_COLORS[level])
 		else:
 			label.configure(text="-", text_color="gray70")
 
-	def _score_probability(self, probability: float | None) -> str | None:
-		if probability is None:
+	def _score_by_threshold(self, value: float | None, good_min: float, okay_min: float) -> str | None:
+		if value is None:
 			return None
-		if probability >= 0.35:
+		if value >= good_min:
 			return "good"
-		if probability >= 0.12:
+		if value >= okay_min:
 			return "okay"
 		return "poor"
+
+	def _score_probability(self, probability: float | None) -> str | None:
+		return self._score_by_threshold(probability, good_min=0.35, okay_min=0.12)
 
 	def _score_margin(self, margin: float | None) -> str | None:
-		if margin is None:
-			return None
-		if margin >= 0.30:
-			return "good"
-		if margin >= 0.15:
-			return "okay"
-		return "poor"
+		return self._score_by_threshold(margin, good_min=0.30, okay_min=0.15)
 
 	def _score_ef_band(self, ef_value: float | None) -> str | None:
-		if ef_value is None:
-			return None
-		if ef_value >= 50.0:
-			return "good"
-		if ef_value >= 40.0:
-			return "okay"
-		return "poor"
+		return self._score_by_threshold(ef_value, good_min=50.0, okay_min=40.0)
 
 	def _score_classification_band(self, classification: str | None) -> str | None:
 		if classification is None:
@@ -288,26 +289,39 @@ class App(ctk.CTk):
 			return
 		self.selected_checkpoint_path = str(self.model_folder / name)
 
+	def _reset_prediction_state(self) -> None:
+		self.last_predicted_ef = None
+		self.last_predicted_classification = None
+		self.last_pred_confidence = None
+		self.last_pred_margin = None
+		self.pred_ef_value.configure(text="-")
+		self.classification_value.configure(text="-")
+		self.confidence_value.configure(text="-")
+		self.margin_value.configure(text="-")
+		self.inference_time_value.configure(text="-")
+		self.data_quality_value.configure(text="-")
+		self.video_meta_value.configure(text="-")
+		self._update_result_quality_indicators()
+
+	def _reset_true_ef_state(self) -> None:
+		self.last_true_ef = None
+		self.last_true_classification = None
+		self.true_ef_value.configure(text="-")
+		self.true_ef_classification_value.configure(text="-")
+		self._update_true_ef_comparison()
+
 	def pick_video(self) -> None:
+		old_video_path = self.selected_video_path
 		path = filedialog.askopenfilename(
 			filetypes=VIDEO_FILETYPES,
 		)
 		if path:
 			self.selected_video_path = path
-			self.last_predicted_ef = None
-			self.last_predicted_classification = None
-			self.last_pred_confidence = None
-			self.last_pred_margin = None
-			self.last_true_ef = None
-			self.last_true_classification = None
-			self.pred_ef_value.configure(text="-")
-			self.classification_value.configure(text="-")
-			self.confidence_value.configure(text="-")
-			self.margin_value.configure(text="-")
-			self.true_ef_value.configure(text="-")
-			self.true_ef_classification_value.configure(text="-")
-			self._update_result_quality_indicators()
-			self._update_true_ef_comparison()
+			if path != old_video_path:
+				self._set_gradcam_generate_mode()
+			self._reset_prediction_state()
+			self._reset_true_ef_state()
+			self._set_error("")
 			self.video_name.configure(text=Path(path).name)
 			self.start_video(path)
 
@@ -360,6 +374,143 @@ class App(ctk.CTk):
 		self.next_frame_time = time.perf_counter() + self.frame_interval_s
 		self.play_next_frame()
 
+	def _set_gradcam_generate_mode(self) -> None:
+		self.gradcam_frames = None
+		self.gradcam_fps = GRADCAM_DEFAULT_FPS
+		self.gradcam_source_video_path = ""
+		self.gradcam_btn.configure(state="normal", text=GRADCAM_GENERATE_TEXT, command=self.generate_gradcam_video)
+
+	def _set_gradcam_export_mode(self, frames_rgb: list[np.ndarray], fps: float, source_video_path: str) -> None:
+		self.gradcam_frames = frames_rgb
+		self.gradcam_fps = fps
+		self.gradcam_source_video_path = source_video_path
+		self.gradcam_btn.configure(state="normal", text=GRADCAM_EXPORT_TEXT, command=self.export_gradcam_video)
+
+	def _load_video_frames_bgr(self, video_path: str) -> tuple[list[np.ndarray], float]:
+		cap = cv2.VideoCapture(video_path)
+		fps = float(cap.get(cv2.CAP_PROP_FPS) or GRADCAM_DEFAULT_FPS)
+		frames_bgr: list[np.ndarray] = []
+		while True:
+			ok, frame = cap.read()
+			if not ok:
+				break
+			frames_bgr.append(frame)
+		cap.release()
+		return frames_bgr, fps
+
+	def _prepare_gradcam_tensor(self, full_frames_bgr: list[np.ndarray]) -> torch.Tensor:
+		small_gray_frames = [
+			cv2.cvtColor(
+				cv2.resize(frame, (self.cfg.TARGET_WIDTH, self.cfg.TARGET_HEIGHT), interpolation=cv2.INTER_AREA),
+				cv2.COLOR_BGR2GRAY,
+			)
+			for frame in full_frames_bgr
+		]
+		clip = np.stack(small_gray_frames).astype(np.float32)
+		mean, std = self._load_stats()
+		clip = clip / 255.0
+		clip = (clip - mean) / std
+		return torch.from_numpy(clip).unsqueeze(0).unsqueeze(0).float()
+
+	def _build_gradcam_overlays(self, full_frames_bgr: list[np.ndarray], cam: np.ndarray) -> list[np.ndarray]:
+		cam_t = cam.shape[0]
+		overlay_frames_rgb: list[np.ndarray] = []
+		for i, frame_bgr in enumerate(full_frames_bgr):
+			idx = min(int(i * cam_t / len(full_frames_bgr)), cam_t - 1)
+			cam_frame = cv2.resize(cam[idx], (frame_bgr.shape[1], frame_bgr.shape[0]), interpolation=cv2.INTER_LINEAR)
+			cam_u8 = np.clip(cam_frame * 255.0, 0, 255).astype(np.uint8)
+			heatmap = cv2.applyColorMap(cam_u8, cv2.COLORMAP_JET)
+			overlay = cv2.addWeighted(frame_bgr, 0.60, heatmap, 0.40, 0.0)
+			overlay_frames_rgb.append(cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB))
+		return overlay_frames_rgb
+
+	def export_gradcam_video(self) -> None:
+		if not self.gradcam_frames:
+			self._set_error("Please generate Grad-CAM first.")
+			return
+
+		default_name = "gradcam_output.mp4"
+		if self.gradcam_source_video_path:
+			default_name = f"{Path(self.gradcam_source_video_path).stem}_gradcam.mp4"
+		initial_dir = str(Path(self.selected_video_path).parent) if self.selected_video_path else str(BASE_DIR)
+
+		output_path = filedialog.asksaveasfilename(
+			title="Export Grad-CAM Video",
+			initialdir=initial_dir,
+			initialfile=default_name,
+			defaultextension=".mp4",
+			filetypes=[("MP4 Video", "*.mp4"), ("AVI Video", "*.avi"), ("All Files", "*.*")],
+		)
+		if not output_path:
+			return
+
+		frames_rgb = self.gradcam_frames
+		height, width = frames_rgb[0].shape[:2]
+		fps = max(float(self.gradcam_fps), 1.0)
+		ext = Path(output_path).suffix.lower()
+		fourcc = cv2.VideoWriter_fourcc(*("mp4v" if ext == ".mp4" else "XVID"))
+		writer = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+		if not writer.isOpened():
+			self._set_error(f"Could not create output file:\n{output_path}")
+			return
+
+		try:
+			for frame_rgb in frames_rgb:
+				writer.write(cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR))
+		finally:
+			writer.release()
+
+		self._set_error("")
+
+	def _generate_gradcam_worker(self, video_path: str, checkpoint_path: str) -> None:
+		try:
+			full_frames_bgr, fps = self._load_video_frames_bgr(video_path)
+
+			if not full_frames_bgr:
+				self.gradcam_queue.put(("error", "Grad-CAM failed: no frames found in video."))
+				return
+
+			input_tensor = self._prepare_gradcam_tensor(full_frames_bgr)
+
+			components = self._load_selected_model_components(checkpoint_path)
+
+			video_device = input_tensor.to(components.device, non_blocking=True)
+			cam = self._compute_gradcam(components.model, video_device)
+			overlay_frames_rgb = self._build_gradcam_overlays(full_frames_bgr, cam)
+
+			self.gradcam_queue.put(("ok", (overlay_frames_rgb, fps, video_path)))
+		except Exception as exc:
+			self.gradcam_queue.put(("error", f"Grad-CAM failed:\n{exc}"))
+
+	def _poll_gradcam_worker(self) -> None:
+		try:
+			status, payload = self.gradcam_queue.get_nowait()
+		except Empty:
+			if self.gradcam_thread and self.gradcam_thread.is_alive():
+				dots = "." * ((self.gradcam_spinner_step % 4))
+				self.gradcam_spinner_step += 1
+				self.gradcam_btn.configure(text=f"Generating{dots}")
+				self.gradcam_poll_after_id = self.after(GRADCAM_POLL_INTERVAL_MS, self._poll_gradcam_worker)
+			else:
+				self._set_gradcam_generate_mode()
+				self.gradcam_thread = None
+				self.gradcam_poll_after_id = None
+			return
+
+		self.gradcam_poll_after_id = None
+		self.gradcam_thread = None
+		if status == "ok":
+			overlay_frames_rgb, fps, source_video_path = payload
+			if source_video_path != self.selected_video_path:
+				self._set_gradcam_generate_mode()
+				return
+			self._start_preview_frames(overlay_frames_rgb, fps)
+			self._set_gradcam_export_mode(overlay_frames_rgb, fps, source_video_path)
+			self._set_error("")
+		else:
+			self._set_gradcam_generate_mode()
+			self._set_error(str(payload))
+
 	def generate_gradcam_video(self) -> None:
 		if not self.selected_checkpoint_path:
 			self._set_error("Please select a model checkpoint (.pt) first.")
@@ -367,61 +518,31 @@ class App(ctk.CTk):
 		if not self.selected_video_path:
 			self._set_error("Please select a video first.")
 			return
+		if self.gradcam_thread and self.gradcam_thread.is_alive():
+			return
 
 		self.gradcam_btn.configure(state="disabled", text="Generating...")
-		self.update_idletasks()
-		try:
-			cap = cv2.VideoCapture(self.selected_video_path)
-			fps = float(cap.get(cv2.CAP_PROP_FPS) or 30.0)
-			full_frames_bgr = []
-			while True:
-				ok, frame = cap.read()
-				if not ok:
-					break
-				full_frames_bgr.append(frame)
-			cap.release()
+		self.gradcam_spinner_step = 0
+		while True:
+			try:
+				self.gradcam_queue.get_nowait()
+			except Empty:
+				break
+		video_path = self.selected_video_path
+		checkpoint_path = self.selected_checkpoint_path
+		self.gradcam_thread = threading.Thread(
+			target=self._generate_gradcam_worker,
+			args=(video_path, checkpoint_path),
+			daemon=True,
+		)
+		self.gradcam_thread.start()
+		self._poll_gradcam_worker()
 
-			if not full_frames_bgr:
-				self._set_error("Grad-CAM failed: no frames found in video.")
-				return
-
-			small_gray_frames = [
-				cv2.cvtColor(
-					cv2.resize(f, (self.cfg.TARGET_WIDTH, self.cfg.TARGET_HEIGHT), interpolation=cv2.INTER_AREA),
-					cv2.COLOR_BGR2GRAY,
-				)
-				for f in full_frames_bgr
-			]
-			clip = np.stack(small_gray_frames).astype(np.float32)
-			mean, std = self._load_stats()
-			clip = clip / 255.0
-			clip = (clip - mean) / std
-			input_tensor = torch.from_numpy(clip).unsqueeze(0).unsqueeze(0).float()
-
-			components = self._load_selected_model_components()
-
-			video_device = input_tensor.to(components.device, non_blocking=True)
-			cam = self._compute_gradcam(components.model, video_device)
-
-			cam_t = cam.shape[0]
-			overlay_frames_rgb = []
-			for i, frame_bgr in enumerate(full_frames_bgr):
-				idx = min(int(i * cam_t / len(full_frames_bgr)), cam_t - 1)
-				cam_frame = cv2.resize(cam[idx], (frame_bgr.shape[1], frame_bgr.shape[0]), interpolation=cv2.INTER_LINEAR)
-				cam_u8 = np.clip(cam_frame * 255.0, 0, 255).astype(np.uint8)
-				heatmap = cv2.applyColorMap(cam_u8, cv2.COLORMAP_JET)
-				overlay = cv2.addWeighted(frame_bgr, 0.60, heatmap, 0.40, 0.0)
-				overlay_frames_rgb.append(cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB))
-
-			self._start_preview_frames(overlay_frames_rgb, fps)
-		except Exception as exc:
-			self._set_error(f"Grad-CAM failed:\n{exc}")
-		finally:
-			self.gradcam_btn.configure(state="normal", text="Generate Grad-CAM")
-
-	def _load_selected_model_components(self):
+	def _load_selected_model_components(self, checkpoint_path: str | None = None):
+		if checkpoint_path is None:
+			checkpoint_path = self.selected_checkpoint_path
 		components = initialize_training_components(class_weights=None)
-		checkpoint = torch.load(self.selected_checkpoint_path, map_location=components.device)
+		checkpoint = torch.load(checkpoint_path, map_location=components.device)
 		components.model.load_state_dict(checkpoint["model_state_dict"])
 		components.model.eval()
 		return components
@@ -614,7 +735,7 @@ class App(ctk.CTk):
 			self._update_true_ef_comparison()
 			self._set_error("")
 		except Exception as exc:
-			self._set_error(f"Inference failed:\n{exc}")
+			self._set_error(f"Prediction failed:\n{exc}")
 		finally:
 			self.inference_busy = False
 			self.run_btn.configure(state="normal", text="Predict EF")
@@ -697,6 +818,9 @@ class App(ctk.CTk):
 			self.video_capture = None
 
 	def on_close(self) -> None:
+		if self.gradcam_poll_after_id is not None:
+			self.after_cancel(self.gradcam_poll_after_id)
+			self.gradcam_poll_after_id = None
 		self.stop_video()
 		self.destroy()
 
