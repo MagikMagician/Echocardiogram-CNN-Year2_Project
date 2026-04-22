@@ -23,9 +23,11 @@ def load_local_config(config_path: Path = LOCAL_CONFIG_FILE) -> dict:
 
 local_config = load_local_config()
 
-# ==============================================================================
-# CONFIGURATION - Centralize all hyperparameters and constants
-# ==============================================================================
+# =============================================================================
+# Project configuration — all hyperparameters, thresholds, and paths in one
+# place.  Override DATASET_PATH via local_config.json to avoid editing this
+# file across different machines.
+# =============================================================================
 class Config:
     """Configuration for the EchoNet-Dynamic project."""
 

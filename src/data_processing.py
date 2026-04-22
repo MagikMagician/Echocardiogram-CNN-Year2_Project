@@ -1,29 +1,25 @@
-# Core Deep Learning
 import torch
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 
-# Data Processing
 import numpy as np
 import pandas as pd
 from collections import Counter
 from typing import List, Tuple, Optional
 from pathlib import Path
 
-# Video/Image Processing
 import cv2
-
-# Utilities
 from tqdm import tqdm
 import json
 
-# Initialize configuration
 from src.config import Config
+
 config = Config()
 
-# ==============================================================================
-# STEP 1: DATA LOADING UTILITIES
-# ==============================================================================
+# =============================================================================
+# Data loading — reads FileList.csv, resolves video paths for each split, and
+# converts raw EF percentages to the three clinical category indices.
+# =============================================================================
 
 
 def split_data(df: pd.DataFrame, split_type: str, video_dir: Path) -> Tuple[List[str], List[float]]:
@@ -42,7 +38,6 @@ def split_data(df: pd.DataFrame, split_type: str, video_dir: Path) -> Tuple[List
     labels = []
     missing_count = 0
 
-    # Filter by split type and check existence
     split_df = df[df["Split"] == split_type]
 
     for _, row in split_df.iterrows():
@@ -85,7 +80,6 @@ def load_video_paths_and_labels() -> Tuple[List[str], List[float], List[str], Li
 
     print(f"Loading data from: {config.file_list_path}")
 
-    # Read CSV and validate columns
     try:
         df = pd.read_csv(config.file_list_path, usecols=["FileName", "Split", "EF"])
     except ValueError as e:
@@ -98,12 +92,10 @@ def load_video_paths_and_labels() -> Tuple[List[str], List[float], List[str], Li
         missing = required_splits - available_splits
         raise ValueError(f"Missing required splits in CSV: {missing}")
 
-    # Load data for each split
     train_videos, train_labels = split_data(df, "TRAIN", config.video_dir_path)
     val_videos, val_labels = split_data(df, "VAL", config.video_dir_path)
     test_videos, test_labels = split_data(df, "TEST", config.video_dir_path)
 
-    # Validate we have data
     if len(train_videos) == 0:
         raise ValueError("No training videos found!")
 
@@ -276,9 +268,11 @@ def compute_dataset_statistics(
     return mean, std
 
 
-# ==============================================================================
-# STEP 2: DATASET CLASS - Loads echocardiogram videos as temporal sequences
-# ==============================================================================
+# =============================================================================
+# PyTorch Dataset — loads individual echocardiogram clips on demand,
+# applies period sampling and normalisation, and returns a 3-tuple of
+# (video tensor, continuous EF, categorical EF label).
+# =============================================================================
 
 
 class EchoDataset(Dataset):
@@ -370,7 +364,7 @@ class EchoDataset(Dataset):
         # Convert EF to clinical category
         ef_category = convert_ef_to_category(ef_continuous)
 
-        # Apply optional transforms
+        # Apply optional spatial augmentations (training only).
         if self.transform:
             video_tensor = self.transform(video_tensor)
 
@@ -381,9 +375,11 @@ class EchoDataset(Dataset):
         )
 
 
-# ==============================================================================
-# STEP 4: CREATE DATALOADERS
-# ==============================================================================
+# =============================================================================
+# DataLoader factory — wraps the three dataset splits with batching, pinned
+# memory, and training augmentation.  Also computes inverse-frequency class
+# weights to counter the heavy skew toward Preserved EF in EchoNet-Dynamic.
+# =============================================================================
 
 
 def _build_train_transform() -> transforms.Compose:
@@ -423,13 +419,10 @@ def create_dataloaders() -> Tuple[DataLoader, DataLoader, DataLoader, torch.Tens
         load_video_paths_and_labels()
     )
 
-    # Compute dataset-wide normalization statistics from training set
-    # This ensures consistent normalization across all videos
-    # Results are cached to avoid recomputation
+    # Normalisation statistics are computed from the training set only
+    # and cached so subsequent runs skip the sampling pass.
     dataset_mean, dataset_std = compute_dataset_statistics(train_videos)
 
-    print("Initializing datasets...")
-    # Create datasets with computed statistics
     train_dataset = EchoDataset(
         video_paths=train_videos,
         labels=train_labels,
@@ -465,7 +458,6 @@ def create_dataloaders() -> Tuple[DataLoader, DataLoader, DataLoader, torch.Tens
             pin_memory=torch.cuda.is_available(),
         )
 
-    # Create DataLoaders
     train_loader = build_dataloader(train_dataset, shuffle=True)
     val_loader = build_dataloader(val_dataset, shuffle=False)
     test_loader = build_dataloader(test_dataset, shuffle=False)
