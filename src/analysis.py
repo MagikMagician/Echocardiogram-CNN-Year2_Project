@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 # Visualization
+import cv2
 import matplotlib.pyplot as plt
 import seaborn as sns
 
@@ -20,7 +21,7 @@ from sklearn.metrics import (
     roc_auc_score,
 )
 
-from src.CNN_model import CNN3D
+from src.CNN_model import R2Plus1DEF
 from src.config import Config
 from src.data_processing import (
     create_dataloaders,
@@ -33,9 +34,11 @@ config = Config()
 CATEGORY_NAMES = ["Reduced (<40%)", "Mildly Reduced (40-49%)", "Preserved (≥50%)"]
 ARTIFACTS_DIR = Path("artifacts")
 
-# ==============================================================================
-# STEP 7: EVALUATION ON TEST SET
-# ==============================================================================
+# =============================================================================
+# Test set evaluation — loads the best checkpoint and computes regression
+# metrics (MAE, RMSE, R²) and classification metrics (accuracy, ROC-AUC)
+# with 95 % bootstrap confidence intervals, plus three diagnostic plots.
+# =============================================================================
 
 
 def _load_best_model(
@@ -177,7 +180,6 @@ def evaluate_on_test_set(
     """
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Load data and model
     _, _, test_loader, class_weights = create_dataloaders()
     components = initialize_training_components(class_weights=class_weights)
     components = _load_best_model(components, checkpoint_path)
@@ -199,7 +201,8 @@ def evaluate_on_test_set(
     # ── Classification metrics ────────────────────────────────────────────────
     acc = accuracy_score(cat_true, cat_pred)
 
-    # ROC-AUC (requires softmax probabilities) – re-run forward pass for logits
+    # ROC-AUC needs class probabilities, not argmax predictions, so we re-run
+    # the forward pass and collect softmax outputs separately.
     components.model.eval()
     all_probs: List[np.ndarray] = []
     with torch.no_grad():
@@ -227,6 +230,24 @@ def evaluate_on_test_set(
     print(classification_report(cat_true, cat_pred, target_names=CATEGORY_NAMES))
     print("=" * 60)
 
+    # ── Persist per-video predictions for future post-hoc analysis ───────────
+    # Saves ef_true, ef_pred, cat_true, cat_pred, and per-class softmax probs
+    # so any additional metric can be computed later without re-running inference.
+    import pandas as pd
+    pred_df = pd.DataFrame({
+        "ef_true":   ef_true,
+        "ef_pred":   ef_pred,
+        "cat_true":  cat_true,
+        "cat_pred":  cat_pred,
+        "abs_error": np.abs(ef_true - ef_pred),
+        "prob_reduced":       prob_matrix[:, 0],
+        "prob_mildly_reduced": prob_matrix[:, 1],
+        "prob_preserved":     prob_matrix[:, 2],
+    })
+    pred_csv = output_dir / "test_predictions.csv"
+    pred_df.to_csv(pred_csv, index=False)
+    print(f"Per-video predictions saved → {pred_csv}")
+
     # ── Plots ──────────────────────────────────────────────────────────────────
     _plot_confusion_matrix(cat_true, cat_pred, output_dir / "confusion_matrix.png")
     _plot_regression_scatter(ef_true, ef_pred, output_dir / "ef_scatter.png")
@@ -240,9 +261,11 @@ def evaluate_on_test_set(
     }
 
 
-# ==============================================================================
-# STEP 8: GRAD-CAM VISUALIZATION
-# ==============================================================================
+# =============================================================================
+# Grad-CAM — gradient-weighted saliency maps that highlight which regions
+# of the echocardiogram clip the model attends to when predicting EF.
+# Helps verify that attention focuses on the left ventricle, not background.
+# =============================================================================
 
 
 class GradCAM3D:
@@ -254,11 +277,11 @@ class GradCAM3D:
 
     Usage::
 
-        gcam = GradCAM3D(model, target_layer=model.feature_extractor[-1])
+        gcam = GradCAM3D(model, target_layer=model.backbone[4][-1])
         heatmap = gcam(video_tensor, class_idx=None)   # None → argmax
     """
 
-    def __init__(self, model: CNN3D, target_layer: nn.Module) -> None:
+    def __init__(self, model: R2Plus1DEF, target_layer: nn.Module) -> None:
         self.model = model
         self._activations: Optional[torch.Tensor] = None
         self._gradients: Optional[torch.Tensor] = None
@@ -291,8 +314,6 @@ class GradCAM3D:
         Returns:
             Saliency map as a numpy array of shape (T, H, W) in [0, 1].
         """
-        self.model.eval()
-        # Forward
         _, logits = self.model(video)
 
         if class_idx is None:
@@ -303,8 +324,8 @@ class GradCAM3D:
         score = logits[0, class_idx]
         score.backward()
 
-        # Global average pool the gradients over spatial+temporal dims
-        # activations / gradients: (1, C, t, h, w)
+        # Grad-CAM: weight each activation channel by its mean gradient, sum
+        # across channels, then ReLU to keep only positively-contributing regions.
         weights = self._gradients.mean(dim=(2, 3, 4), keepdim=True)  # (1, C, 1, 1, 1)
         cam = (weights * self._activations).sum(dim=1, keepdim=True)  # (1, 1, t, h, w)
         cam = torch.relu(cam).squeeze().cpu().numpy()  # (t, h, w) or (h, w)
@@ -344,13 +365,9 @@ def run_gradcam_visualization(
     model = components.model
     device = components.device
 
-    # Hook onto the last residual block (R2+1D) or last conv block (CNN3D).
     # model.backbone is nn.Sequential(stem, layer1, layer2, layer3, layer4, avgpool)
-    # so layer4 is at index 4.
-    if hasattr(model, 'backbone'):
-        target_layer = model.backbone[4][-1]
-    else:
-        target_layer = model.feature_extractor[-1]
+    # layer4 (index 4) is the deepest residual block — best for saliency.
+    target_layer = model.backbone[4][-1]
     gcam = GradCAM3D(model, target_layer)
 
     samples_done = 0
@@ -387,10 +404,9 @@ def run_gradcam_visualization(
                 cam_t = int(t * cam.shape[0] / T)
                 cam_t = min(cam_t, cam.shape[0] - 1)
                 cam_frame = cam[cam_t]  # (h_small, w_small)
-                import cv2 as _cv2
-                cam_resized = _cv2.resize(
+                cam_resized = cv2.resize(
                     cam_frame, (frame.shape[1], frame.shape[0]),
-                    interpolation=_cv2.INTER_LINEAR,
+                    interpolation=cv2.INTER_LINEAR,
                 )
                 axes[1, col].imshow(frame_disp, cmap="gray", vmin=0, vmax=1)
                 axes[1, col].imshow(cam_resized, cmap="jet", alpha=0.45, vmin=0, vmax=1)
@@ -417,9 +433,190 @@ def run_gradcam_visualization(
     print(f"Grad-CAM visualizations complete ({samples_done} samples).")
 
 
-# ==============================================================================
-# STEP 9: ABLATION STUDY
-# ==============================================================================
+# =============================================================================
+# Grad-CAM with expert LV overlay — three-row visual comparison showing
+# (1) raw frame, (2) cardiologist's LV contour, and (3) the model's Grad-CAM
+# attention.  Only run on videos that have VolumeTracings annotations so we
+# can directly compare model attention to expert anatomy frame-by-frame.
+# =============================================================================
+
+
+def run_gradcam_with_lv_overlay(
+    checkpoint_path: Path = ARTIFACTS_DIR / "best_r2plus1d.pt",
+    tracings_path: Path = Path("dataset/VolumeTracings.csv"),
+    num_samples: int = 8,
+    output_dir: Path = ARTIFACTS_DIR / "gradcam",
+) -> None:
+    """
+    Produce three-row Grad-CAM figures that layer the model's attention on top
+    of the cardiologist's LV contour for frames that have expert annotations.
+
+    Row 1: raw echocardiogram frame
+    Row 2: frame + cyan LV contour from VolumeTracings
+    Row 3: frame + Grad-CAM heatmap (model's attention)
+
+    This makes model-vs-expert comparison intuitive at a glance: if the
+    heatmap sits inside the cyan contour, the model is "looking at the heart".
+    """
+    import pandas as pd
+
+    if not checkpoint_path.exists():
+        print(f"Checkpoint not found at {checkpoint_path}. Skipping overlay Grad-CAM.")
+        return
+    if not tracings_path.exists():
+        print(f"VolumeTracings not found at {tracings_path}. Skipping overlay Grad-CAM.")
+        return
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    tracings = pd.read_csv(tracings_path)
+    traced_files = set(tracings["FileName"].unique())
+
+    _, _, test_loader, class_weights = create_dataloaders()
+    components = initialize_training_components(class_weights=class_weights)
+    components = _load_best_model(components, checkpoint_path)
+    model = components.model
+    device = components.device
+
+    target_layer = model.backbone[4][-1]
+    gcam = GradCAM3D(model, target_layer)
+
+    # Iterate per-video via dataset so we can filter to annotated ones.
+    dataset = test_loader.dataset
+    samples_done = 0
+
+    for idx in range(len(dataset)):
+        if samples_done >= num_samples:
+            break
+
+        fname = Path(dataset.video_paths[idx]).name
+        if fname not in traced_files:
+            continue
+
+        video_tracings = tracings[tracings["FileName"] == fname]
+        annotated_frames = sorted(int(f) for f in video_tracings["Frame"].unique())
+        if not annotated_frames:
+            continue
+
+        # Determine the actual clip window the dataset used for this video.
+        # Test set uses random_start=False, so start = (total - window) // 2.
+        cap = cv2.VideoCapture(dataset.video_paths[idx])
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        cap.release()
+        num_frames = dataset.num_frames
+        period = dataset.period
+        window = num_frames * period
+        if total_frames <= window:
+            clip_start = 0
+            clip_indices = np.linspace(0, total_frames - 1, num_frames, dtype=int)
+        else:
+            clip_start = (total_frames - window) // 2
+            clip_indices = np.arange(clip_start, clip_start + window, period, dtype=int)
+
+        # Keep only annotated frames that fall inside this clip window.
+        def _orig_to_sampled(orig: int) -> Optional[int]:
+            diffs = np.abs(clip_indices - orig)
+            nearest = int(np.argmin(diffs))
+            return nearest if diffs[nearest] <= period // 2 else None
+
+        annotated_in_clip = [
+            (orig, _orig_to_sampled(orig)) for orig in annotated_frames
+        ]
+        annotated_in_clip = [(o, s) for o, s in annotated_in_clip if s is not None]
+        if not annotated_in_clip:
+            continue  # Skip — no annotated frame falls inside the sampled clip
+
+        video_tensor, ef_true, ef_class = dataset[idx]
+        video_input = video_tensor.unsqueeze(0).to(device)
+        cam = gcam(video_input)  # (T_cam, h, w) normalised [0,1]
+
+        frames = video_tensor[0].cpu().numpy()  # (T, H, W)
+        T = frames.shape[0]
+
+        # Build display: the annotated sampled indices plus 4 evenly spaced fillers.
+        filler = list(np.linspace(0, T - 1, 4, dtype=int))
+        display_idx = sorted(set(filler + [s for _, s in annotated_in_clip]))[:6]
+
+        # Map each sampled index back to the annotation it corresponds to (if any)
+        sampled_to_orig = {s: o for o, s in annotated_in_clip}
+
+        fig, axes = plt.subplots(3, len(display_idx),
+                                 figsize=(2.2 * len(display_idx), 7))
+        if len(display_idx) == 1:
+            axes = axes[:, np.newaxis]
+
+        for col, t in enumerate(display_idx):
+            frame = frames[t]
+            frame_disp = (frame - frame.min()) / max(frame.max() - frame.min(), 1e-6)
+
+            # ── Row 1: raw frame ──────────────────────────────────────────────
+            axes[0, col].imshow(frame_disp, cmap="gray", vmin=0, vmax=1)
+            axes[0, col].set_xticks([]); axes[0, col].set_yticks([])
+            if col == 0:
+                axes[0, col].set_ylabel("Frame", fontsize=9)
+
+            # ── Row 2: expert LV contour overlay (only on annotated frames) ───
+            axes[1, col].imshow(frame_disp, cmap="gray", vmin=0, vmax=1)
+            axes[1, col].set_xticks([]); axes[1, col].set_yticks([])
+            if col == 0:
+                axes[1, col].set_ylabel("Expert LV", fontsize=9)
+
+            if t in sampled_to_orig:
+                orig_frame = sampled_to_orig[t]
+                lv_mask = _build_lv_mask(
+                    video_tracings, orig_frame,
+                    height=config.TARGET_HEIGHT, width=config.TARGET_WIDTH,
+                )
+                if lv_mask is not None and lv_mask.sum() > 0:
+                    contours, _ = cv2.findContours(
+                        lv_mask.astype(np.uint8), cv2.RETR_EXTERNAL,
+                        cv2.CHAIN_APPROX_SIMPLE,
+                    )
+                    for contour in contours:
+                        pts = contour.squeeze()
+                        if pts.ndim == 2 and len(pts) > 2:
+                            axes[1, col].plot(
+                                np.append(pts[:, 0], pts[0, 0]),
+                                np.append(pts[:, 1], pts[0, 1]),
+                                color="cyan", linewidth=2,
+                            )
+                    axes[1, col].set_title(f"ED/ES (f={orig_frame})",
+                                            fontsize=7, color="cyan")
+
+            # ── Row 3: Grad-CAM overlay ───────────────────────────────────────
+            cam_t = min(int(t * cam.shape[0] / T), cam.shape[0] - 1)
+            cam_resized = cv2.resize(
+                cam[cam_t], (frame.shape[1], frame.shape[0]),
+                interpolation=cv2.INTER_LINEAR,
+            )
+            axes[2, col].imshow(frame_disp, cmap="gray", vmin=0, vmax=1)
+            axes[2, col].imshow(cam_resized, cmap="jet", alpha=0.45, vmin=0, vmax=1)
+            axes[2, col].set_xticks([]); axes[2, col].set_yticks([])
+            if col == 0:
+                axes[2, col].set_ylabel("Grad-CAM", fontsize=9)
+
+        fig.suptitle(
+            f"Overlay Sample {samples_done + 1} | {fname} | "
+            f"True EF: {float(ef_true):.1f}% | "
+            f"Category: {CATEGORY_NAMES[int(ef_class)]}",
+            fontsize=9,
+        )
+        fig.tight_layout()
+        out_file = output_dir / f"gradcam_overlay_{samples_done + 1:03d}.png"
+        fig.savefig(out_file, dpi=150)
+        plt.close(fig)
+        samples_done += 1
+        print(f"Grad-CAM overlay saved → {out_file}")
+
+    gcam.remove_hooks()
+    print(f"Grad-CAM LV-overlay visualizations complete ({samples_done} samples).")
+
+
+# =============================================================================
+# Ablation study — trains four R(2+1)D variants to isolate the contribution
+# of frame count and each loss head.  Each variant gets a fresh model and
+# optimizer so results are independent.
+# =============================================================================
 
 
 def _ablation_variant(
@@ -428,29 +625,68 @@ def _ablation_variant(
     num_epochs: int,
     regression_weight: float,
     classification_weight: float,
+    pretrained: bool = True,
+    use_shared_head: bool = True,
 ) -> Dict[str, float]:
     """
     Train a single ablation variant and return its best validation metrics.
 
     The variant temporarily overrides ``config.NUM_FRAMES`` so the dataloader
     samples the correct number of frames.  A fresh model and optimizer are
-    created for each run to keep variants independent.
+    created for each run to keep variants independent.  ``pretrained=False``
+    disables Kinetics-400 weight initialisation; ``use_shared_head=False``
+    skips the 512→256→128 MLP and predicts directly from backbone features.
     """
     from src.training import train_model
 
     print(f"\n{'='*60}")
     print(f"ABLATION VARIANT: {tag}")
-    print(f"  frames={num_frames}, reg_w={regression_weight}, cls_w={classification_weight}")
+    print(f"  frames={num_frames}, reg_w={regression_weight}, "
+          f"cls_w={classification_weight}, pretrained={pretrained}, "
+          f"shared_head={use_shared_head}")
     print(f"{'='*60}")
 
-    # Temporary config override
+    checkpoint = ARTIFACTS_DIR / "ablation" / f"{tag}.pt"
+
+    # Skip training if a checkpoint already exists — load stored metrics instead.
+    if checkpoint.exists():
+        print(f"Checkpoint found at {checkpoint} — skipping training.")
+        saved = torch.load(checkpoint, map_location="cpu")
+        return {
+            "tag": tag,
+            "best_epoch": saved.get("epoch", "?"),
+            "val_loss": saved.get("val_loss", float("nan")),
+            "val_mae": saved.get("val_mae", float("nan")),
+            "val_accuracy": saved.get("val_accuracy", float("nan")),
+        }
+
+    # Temporarily override the global frame count so the dataloader
+    # samples the right number of frames for this variant.
     original_num_frames = config.NUM_FRAMES
     config.NUM_FRAMES = num_frames
 
     try:
         train_loader, val_loader, _, class_weights = create_dataloaders()
         components = initialize_training_components(class_weights=class_weights)
-        checkpoint = ARTIFACTS_DIR / "ablation" / f"{tag}.pt"
+
+        # Swap in a model with different architectural flags if requested.
+        # Rebuilds the model and reattaches a fresh optimizer so downstream
+        # training code is unchanged.
+        if not pretrained or not use_shared_head:
+            import torch.optim as optim
+            components.model = R2Plus1DEF(
+                num_classes=config.NUM_CATEGORIES,
+                pretrained=pretrained,
+                use_shared_head=use_shared_head,
+            ).to(components.device)
+            components.optimizer = optim.SGD(
+                components.model.parameters(),
+                lr=config.LEARNING_RATE, momentum=0.9,
+            )
+            components.scheduler = optim.lr_scheduler.StepLR(
+                components.optimizer, step_size=15, gamma=0.1,
+            )
+
         history = train_model(
             train_loader, val_loader, components,
             num_epochs=num_epochs,
@@ -479,32 +715,38 @@ def run_ablation_study(
     """
     Run a structured ablation study comparing key design choices.
 
-    Variants tested (following EchoNet-Dynamic ablation conventions):
-    1. Baseline  – 16 frames, equal loss weights
-    2. More frames – 32 frames
-    3. Regression-only – classification weight = 0
-    4. Classification-only – regression weight = 0
+    Variants tested:
+    1. Baseline           – full model: 16 frames, dual-head, shared MLP, pretrained
+    2. No pretraining     – identical, but backbone initialised from scratch
+    3. Regression-only    – classification loss weight = 0 (replicates Stanford's
+                             original single-task design)
+    4. No shared head     – skips the 512→256→128 MLP; two linear heads read
+                             directly from backbone features
 
+    This isolates three orthogonal design decisions: transfer learning,
+    multi-task auxiliary classification, and the shared embedding MLP.
     Results are printed as a summary table and saved as a bar chart.
     """
     output_dir.mkdir(parents=True, exist_ok=True)
 
     variants = [
-        # (tag,              frames, reg_w, cls_w)
-        ("baseline_16f",       16,   1.0,  1.0),
-        ("more_frames_32f",    32,   1.0,  1.0),
-        ("regression_only",    16,   1.0,  0.0),
-        ("classification_only",16,   0.0,  1.0),
+        # (tag,             frames, reg_w, cls_w, pretrained, shared_head)
+        ("baseline_16f",       16,   1.0,  1.0,  True,  True),
+        ("no_pretrain",        16,   1.0,  1.0,  False, True),
+        ("regression_only",    16,   1.0,  0.0,  True,  True),
+        ("no_shared_head",     16,   1.0,  1.0,  True,  False),
     ]
 
     results = []
-    for tag, frames, reg_w, cls_w in variants:
+    for tag, frames, reg_w, cls_w, pretrained, shared_head in variants:
         result = _ablation_variant(
             tag=tag,
             num_frames=frames,
             num_epochs=num_epochs_per_variant,
             regression_weight=reg_w,
             classification_weight=cls_w,
+            pretrained=pretrained,
+            use_shared_head=shared_head,
         )
         results.append(result)
 
@@ -544,18 +786,20 @@ def run_ablation_study(
     print(f"Ablation chart saved → {chart_path}")
 
 
-# ==============================================================================
-# UTILITY: Plot training curves (called from main if history is available)
-# ==============================================================================
+# =============================================================================
+# Convenience wrapper — called from main.py when training history is available.
+# =============================================================================
+
 
 def plot_training_curves(history: Dict[str, List[float]]) -> None:
     """Save training curves to artifacts/evaluation/training_curves.png."""
     _plot_training_curves(history, ARTIFACTS_DIR / "evaluation" / "training_curves.png")
 
 
-# ==============================================================================
-# BOOTSTRAP CONFIDENCE INTERVALS
-# ==============================================================================
+# =============================================================================
+# Bootstrap confidence intervals — non-parametric 95 % CIs by resampling the
+# test set 10,000 times (method used in the EchoNet-Dynamic paper).
+# =============================================================================
 
 
 def _bootstrap_ci(
@@ -588,9 +832,11 @@ def _bootstrap_ci(
     )
 
 
-# ==============================================================================
-# BLAND-ALTMAN AGREEMENT PLOT
-# ==============================================================================
+# =============================================================================
+# Bland-Altman plot — standard medical imaging agreement plot that shows
+# (predicted − actual) vs the mean of both.  Exposes systematic bias across
+# different EF ranges (e.g. under-prediction at high EF values).
+# =============================================================================
 
 
 def _plot_bland_altman(ef_true: np.ndarray, ef_pred: np.ndarray, save_path: Path) -> None:
@@ -626,5 +872,534 @@ def _plot_bland_altman(ef_true: np.ndarray, ef_pred: np.ndarray, save_path: Path
     fig.savefig(save_path, dpi=150)
     plt.close(fig)
     print(f"Bland-Altman plot saved \u2192 {save_path}")
+
+
+# =============================================================================
+# Grad-CAM localisation vs VolumeTracings — quantifies how much of the
+# model's attention falls inside the expert-annotated left ventricle.
+#
+# VolumeTracings.csv contains polyline segments (X1,Y1)→(X2,Y2) per frame
+# that together outline the LV boundary at end-diastole and end-systole.
+# We rasterise each outline into a binary mask, threshold the Grad-CAM
+# heatmap at its median value, and compute IoU for each annotated frame.
+# This answers: "Is the model looking at the right anatomy?"
+# =============================================================================
+
+
+def _build_lv_mask(
+    tracings: "object",  # pandas DataFrame
+    frame_idx: int,
+    height: int = 112,
+    width: int = 112,
+) -> Optional[np.ndarray]:
+    """
+    Build a binary (H, W) mask of the left ventricle from polyline segments.
+
+    The VolumeTracings format stores the LV boundary as a sequence of short
+    line segments (X1,Y1)→(X2,Y2).  We collect all endpoints, form a closed
+    polygon, and fill it using cv2.fillPoly.
+
+    Returns None when fewer than 3 distinct points are found (degenerate case).
+    """
+    frame_rows = tracings[tracings["Frame"] == frame_idx]
+    if frame_rows.empty:
+        return None
+
+    # Collect left-border and right-border points, then close the loop.
+    left_pts  = frame_rows[["X1", "Y1"]].values  # (N, 2)
+    right_pts = frame_rows[["X2", "Y2"]].values  # (N, 2)
+
+    # Traverse left border top→bottom, right border bottom→top to form a
+    # closed polygon (standard for EchoNet-Dynamic tracings).
+    polygon = np.concatenate([left_pts, right_pts[::-1]], axis=0)
+    polygon = np.clip(np.round(polygon).astype(np.int32), 0, max(height, width) - 1)
+    polygon[:, 0] = np.clip(polygon[:, 0], 0, width - 1)
+    polygon[:, 1] = np.clip(polygon[:, 1], 0, height - 1)
+
+    if len(np.unique(polygon, axis=0)) < 3:
+        return None
+
+    mask = np.zeros((height, width), dtype=np.uint8)
+    cv2.fillPoly(mask, [polygon], color=1)
+    return mask.astype(bool)
+
+
+def _compute_iou(pred_mask: np.ndarray, gt_mask: np.ndarray) -> float:
+    """Intersection-over-Union between two boolean masks."""
+    intersection = float(np.logical_and(pred_mask, gt_mask).sum())
+    union        = float(np.logical_or(pred_mask, gt_mask).sum())
+    return intersection / union if union > 0 else 0.0
+
+
+def run_gradcam_lv_iou(
+    checkpoint_path: Path = ARTIFACTS_DIR / "best_r2plus1d.pt",
+    tracings_path: Path = Path("dataset/VolumeTracings.csv"),
+    output_dir: Path = ARTIFACTS_DIR / "evaluation",
+    max_videos: int = 200,
+) -> Dict[str, float]:
+    """
+    Quantify Grad-CAM localisation quality against expert LV annotations.
+
+    For each test video that has VolumeTracings annotations we:
+      1. Run a forward pass to get the Grad-CAM saliency map (T, H, W).
+      2. Identify the annotated frames (end-diastole / end-systole).
+      3. Build a binary LV mask from the polyline segments.
+      4. Threshold the saliency map at its median and compute IoU.
+
+    Outputs:
+      - ``gradcam_iou_scatter.png`` — IoU vs prediction error per video
+      - ``gradcam_iou_histogram.png`` — distribution of IoU scores
+      - printed summary statistics
+
+    Returns a dict with mean/median IoU and the Pearson correlation between
+    IoU and absolute EF prediction error.
+    """
+    import pandas as pd
+    from scipy import stats as scipy_stats
+
+    if not checkpoint_path.exists():
+        print(f"Checkpoint not found at {checkpoint_path}. Skipping IoU analysis.")
+        return {}
+    if not tracings_path.exists():
+        print(f"VolumeTracings not found at {tracings_path}. Skipping IoU analysis.")
+        return {}
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    tracings = pd.read_csv(tracings_path)
+    traced_files = set(tracings["FileName"].unique())
+
+    _, _, test_loader, class_weights = create_dataloaders()
+    components = initialize_training_components(class_weights=class_weights)
+    components = _load_best_model(components, checkpoint_path)
+    model = components.model
+    device = components.device
+
+    # Target layer: last residual block of the R(2+1)D backbone
+    target_layer = components.model.backbone[4][-1]
+    gcam = GradCAM3D(model, target_layer)
+
+    iou_scores: List[float] = []
+    abs_errors: List[float] = []
+    video_names: List[str] = []
+    samples_done = 0
+
+    # We need per-video access so we iterate the underlying dataset directly.
+    dataset = test_loader.dataset
+    indices = list(range(len(dataset)))
+
+    for idx in indices:
+        if samples_done >= max_videos:
+            break
+
+        video_tensor, ef_true, _ = dataset[idx]
+
+        # Resolve the video filename from the dataset's path list.
+        video_path = Path(dataset.video_paths[idx])
+        fname = video_path.name  # e.g. "0X1234....avi"
+        if fname not in traced_files:
+            continue
+
+        video_input = video_tensor.unsqueeze(0).to(device)
+
+        # Grad-CAM gives (T, H, W) — T corresponds to the sampled frames.
+        cam = gcam(video_input, class_idx=None)  # (T, H, W) in [0,1]
+
+        # Identify annotated frame indices within the video
+        video_tracings = tracings[tracings["FileName"] == fname]
+        annotated_frames = sorted(video_tracings["Frame"].unique())
+
+        # The video was sub-sampled at FRAME_SAMPLING_PERIOD.  Map annotated
+        # original frame indices to the nearest sampled time step.
+        num_sampled = cam.shape[0]
+        sampling_period = config.FRAME_SAMPLING_PERIOD
+
+        frame_ious: List[float] = []
+        for orig_frame in annotated_frames:
+            sampled_idx = min(int(orig_frame // sampling_period), num_sampled - 1)
+            cam_slice   = cam[sampled_idx]  # (H, W)
+
+            lv_mask = _build_lv_mask(
+                video_tracings, orig_frame,
+                height=config.TARGET_HEIGHT, width=config.TARGET_WIDTH,
+            )
+            if lv_mask is None or lv_mask.sum() == 0:
+                continue
+
+            # Resize CAM to match the LV mask resolution (the backbone's last
+            # conv produces a smaller spatial map, e.g. 7×7, which must be
+            # upsampled to 112×112 before comparing with the annotation mask).
+            cam_resized = cv2.resize(
+                cam_slice.astype(np.float32),
+                (config.TARGET_WIDTH, config.TARGET_HEIGHT),
+                interpolation=cv2.INTER_LINEAR,
+            )
+            # Threshold Grad-CAM at its median to obtain a binary attention map.
+            cam_binary = cam_resized >= np.median(cam_resized)
+            frame_ious.append(_compute_iou(cam_binary, lv_mask))
+
+        if not frame_ious:
+            continue
+
+        # Get model prediction for this video
+        model.eval()
+        with torch.no_grad():
+            ef_pred, _ = model(video_input)
+        ef_pred_val = float(ef_pred.cpu().item())
+        abs_err = abs(ef_pred_val - float(ef_true))
+
+        iou_scores.append(float(np.mean(frame_ious)))
+        abs_errors.append(abs_err)
+        video_names.append(fname)
+        samples_done += 1
+
+    gcam.remove_hooks()
+
+    if not iou_scores:
+        print("No annotated test videos found for IoU analysis.")
+        return {}
+
+    iou_arr = np.array(iou_scores)
+    err_arr = np.array(abs_errors)
+
+    # Pearson correlation: does better localisation → lower error?
+    r, p_val = scipy_stats.pearsonr(iou_arr, err_arr)
+
+    print("\n" + "=" * 60)
+    print("GRAD-CAM LOCALISATION vs LV ANNOTATIONS (IoU)")
+    print("=" * 60)
+    print(f"  Videos analysed : {samples_done}")
+    print(f"  Mean IoU        : {iou_arr.mean():.4f}")
+    print(f"  Median IoU      : {np.median(iou_arr):.4f}")
+    print(f"  Std IoU         : {iou_arr.std():.4f}")
+    print(f"  IoU ↔ |Error| r : {r:.4f}  (p={p_val:.4f})")
+    print("=" * 60)
+
+    # ── Scatter: IoU vs absolute prediction error ─────────────────────────────
+    fig, axes = plt.subplots(1, 2, figsize=(13, 5))
+
+    axes[0].scatter(iou_arr, err_arr, alpha=0.5, s=15, color="steelblue")
+    m, b = np.polyfit(iou_arr, err_arr, 1)
+    x_line = np.linspace(iou_arr.min(), iou_arr.max(), 100)
+    axes[0].plot(x_line, m * x_line + b, "r--", linewidth=1.5,
+                 label=f"r={r:.3f}, p={p_val:.3f}")
+    axes[0].set_xlabel("Grad-CAM IoU with LV Mask")
+    axes[0].set_ylabel("Absolute EF Prediction Error (%)")
+    axes[0].set_title("Localisation Quality vs Prediction Error")
+    axes[0].legend()
+
+    # ── Histogram of IoU scores ───────────────────────────────────────────────
+    axes[1].hist(iou_arr, bins=25, color="seagreen", edgecolor="white", linewidth=0.5)
+    axes[1].axvline(iou_arr.mean(), color="red", linestyle="--",
+                    linewidth=1.5, label=f"Mean = {iou_arr.mean():.3f}")
+    axes[1].set_xlabel("Grad-CAM IoU with LV Mask")
+    axes[1].set_ylabel("Count")
+    axes[1].set_title("Distribution of LV Localisation IoU Scores")
+    axes[1].legend()
+
+    fig.suptitle("Grad-CAM Localisation vs Expert LV Annotations")
+    fig.tight_layout()
+    scatter_path = output_dir / "gradcam_iou_analysis.png"
+    fig.savefig(scatter_path, dpi=150)
+    plt.close(fig)
+    print(f"IoU analysis plot saved \u2192 {scatter_path}")
+
+    return {
+        "mean_iou": float(iou_arr.mean()),
+        "median_iou": float(np.median(iou_arr)),
+        "iou_error_correlation": float(r),
+        "iou_error_pvalue": float(p_val),
+        "n_videos": samples_done,
+    }
+
+
+# =============================================================================
+# Subgroup analysis — breaks test performance down by EF range to surface
+# whether the model is reliably accurate across the full clinical spectrum.
+# Clinically, errors in the "Reduced (<40%)" group are the most dangerous.
+# =============================================================================
+
+
+# Clinical EF bands with labels
+_EF_BANDS = [
+    (0.0,  20.0, "Severely Reduced\n(<20%)"),
+    (20.0, 40.0, "Reduced\n(20–40%)"),
+    (40.0, 50.0, "Mildly Reduced\n(40–50%)"),
+    (50.0, 70.0, "Preserved\n(50–70%)"),
+    (70.0, 100.0,"Hyperdynamic\n(>70%)"),
+]
+
+# Clinical cost matrix: rows=actual, cols=predicted (0=Reduced, 1=Mildly, 2=Preserved)
+# Misclassifying Reduced as Preserved is the most dangerous error (weight=3).
+_CLINICAL_COST_MATRIX = np.array([
+    [0, 1, 3],  # Actual Reduced
+    [1, 0, 1],  # Actual Mildly Reduced
+    [2, 1, 0],  # Actual Preserved
+], dtype=float)
+
+
+def run_subgroup_analysis(
+    checkpoint_path: Path = ARTIFACTS_DIR / "best_r2plus1d.pt",
+    output_dir: Path = ARTIFACTS_DIR / "evaluation",
+) -> Dict[str, object]:
+    """
+    Break down test-set performance by EF range.
+
+    For each clinical EF band (Severely Reduced → Hyperdynamic) reports:
+      - Sample count
+      - Mean Absolute Error (MAE)
+      - Root Mean Squared Error (RMSE)
+      - Category accuracy
+
+    Also computes a cost-weighted confusion matrix where misclassifying a
+    Reduced patient as Preserved is penalised more heavily than the reverse,
+    reflecting real clinical consequences.
+
+    Outputs:
+      - ``subgroup_analysis.png`` — MAE and accuracy bar charts per band
+      - ``clinical_cost_confusion.png`` — cost-weighted confusion matrix heatmap
+      - printed summary table
+    """
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    _, _, test_loader, class_weights = create_dataloaders()
+    components = initialize_training_components(class_weights=class_weights)
+    components = _load_best_model(components, checkpoint_path)
+
+    ef_true, ef_pred, cat_true, cat_pred = _collect_predictions(
+        test_loader, components.model, components.device
+    )
+
+    # ── Per-band metrics ───────────────────────────────────────────────────────
+    band_results = []
+    for lo, hi, label in _EF_BANDS:
+        mask = (ef_true >= lo) & (ef_true < hi)
+        n = int(mask.sum())
+        if n == 0:
+            continue
+        mae  = float(mean_absolute_error(ef_true[mask], ef_pred[mask]))
+        rmse = float(np.sqrt(mean_squared_error(ef_true[mask], ef_pred[mask])))
+        acc  = float(accuracy_score(cat_true[mask], cat_pred[mask]))
+        band_results.append({
+            "label": label, "n": n,
+            "mae": mae, "rmse": rmse, "accuracy": acc,
+        })
+
+    # ── Print summary table ────────────────────────────────────────────────────
+    print("\n" + "=" * 75)
+    print("SUBGROUP ANALYSIS BY EF RANGE")
+    print(f"{'EF Band':<25} {'N':>5} {'MAE (%)':>9} {'RMSE (%)':>10} {'Accuracy':>10}")
+    print("-" * 75)
+    for r in band_results:
+        label_flat = r["label"].replace("\n", " ")
+        print(f"{label_flat:<25} {r['n']:>5} {r['mae']:>9.2f} {r['rmse']:>10.2f} {r['accuracy']:>10.4f}")
+    print("=" * 75)
+
+    # ── Bar charts ─────────────────────────────────────────────────────────────
+    labels = [r["label"] for r in band_results]
+    counts = [r["n"] for r in band_results]
+    maes   = [r["mae"] for r in band_results]
+    accs   = [r["accuracy"] for r in band_results]
+
+    x = np.arange(len(labels))
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+    bars0 = axes[0].bar(x, maes, color="steelblue", width=0.6)
+    axes[0].set_xticks(x)
+    axes[0].set_xticklabels(labels, fontsize=8)
+    axes[0].set_ylabel("MAE (EF %)")
+    axes[0].set_title("MAE by EF Subgroup")
+    # Annotate with sample counts
+    for bar, n in zip(bars0, counts):
+        axes[0].text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.1,
+                     f"n={n}", ha="center", va="bottom", fontsize=7)
+
+    bars1 = axes[1].bar(x, accs, color="seagreen", width=0.6)
+    axes[1].set_xticks(x)
+    axes[1].set_xticklabels(labels, fontsize=8)
+    axes[1].set_ylabel("Category Accuracy")
+    axes[1].set_ylim(0, 1.1)
+    axes[1].set_title("Category Accuracy by EF Subgroup")
+    for bar, n in zip(bars1, counts):
+        axes[1].text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.01,
+                     f"n={n}", ha="center", va="bottom", fontsize=7)
+
+    fig.suptitle("Subgroup Analysis by Clinical EF Range")
+    fig.tight_layout()
+    subgroup_path = output_dir / "subgroup_analysis.png"
+    fig.savefig(subgroup_path, dpi=150)
+    plt.close(fig)
+    print(f"Subgroup analysis plot saved \u2192 {subgroup_path}")
+
+    # ── Clinical cost-weighted confusion matrix ────────────────────────────────
+    cm = confusion_matrix(cat_true, cat_pred, labels=[0, 1, 2])
+    cost_cm = cm * _CLINICAL_COST_MATRIX
+
+    fig2, axes2 = plt.subplots(1, 2, figsize=(14, 5))
+
+    sns.heatmap(cm, annot=True, fmt="d", cmap="Blues",
+                xticklabels=CATEGORY_NAMES, yticklabels=CATEGORY_NAMES,
+                ax=axes2[0])
+    axes2[0].set_xlabel("Predicted")
+    axes2[0].set_ylabel("Actual")
+    axes2[0].set_title("Standard Confusion Matrix")
+
+    sns.heatmap(cost_cm, annot=True, fmt=".0f", cmap="Reds",
+                xticklabels=CATEGORY_NAMES, yticklabels=CATEGORY_NAMES,
+                ax=axes2[1])
+    axes2[1].set_xlabel("Predicted")
+    axes2[1].set_ylabel("Actual")
+    axes2[1].set_title("Cost-Weighted Confusion Matrix\n(Higher = More Dangerous Error)")
+
+    fig2.suptitle("Clinical Cost Analysis of Misclassifications")
+    fig2.tight_layout()
+    cost_path = output_dir / "clinical_cost_confusion.png"
+    fig2.savefig(cost_path, dpi=150)
+    plt.close(fig2)
+    print(f"Clinical cost confusion matrix saved \u2192 {cost_path}")
+
+    total_cost = float(cost_cm.sum())
+    worst_error = float(cost_cm[0, 2])  # Reduced predicted as Preserved
+    print(f"  Total clinical cost score : {total_cost:.0f}")
+    print(f"  Reduced→Preserved errors  : {int(cm[0, 2])} cases (cost {worst_error:.0f})")
+
+    return {"band_results": band_results, "total_clinical_cost": total_cost}
+
+
+# =============================================================================
+# Calibration analysis — checks whether the model's stated confidence (softmax
+# probability) actually matches its empirical accuracy.  A well-calibrated
+# model that says "80% confident" should be correct roughly 80% of the time.
+#
+# Reports Expected Calibration Error (ECE) and draws a reliability diagram.
+# This validates whether the classification head is trustworthy for clinical use.
+# =============================================================================
+
+
+def run_calibration_analysis(
+    checkpoint_path: Path = ARTIFACTS_DIR / "best_r2plus1d.pt",
+    output_dir: Path = ARTIFACTS_DIR / "evaluation",
+    n_bins: int = 10,
+) -> Dict[str, float]:
+    """
+    Assess calibration of the classification head via a reliability diagram.
+
+    Predictions are bucketed into ``n_bins`` equal-width confidence bins
+    (0.0–0.1, 0.1–0.2, …, 0.9–1.0).  Within each bin the fraction of
+    correct predictions (empirical accuracy) is plotted against the mean
+    predicted probability (confidence).  A perfectly calibrated model lies
+    on the diagonal.
+
+    Expected Calibration Error (ECE) is the bin-size-weighted mean of
+    |accuracy − confidence| across all bins.  Lower is better.
+
+    Outputs:
+      - ``calibration_reliability.png`` — reliability diagram + ECE annotation
+      - printed ECE value
+
+    Returns a dict with ECE and per-bin statistics.
+    """
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    _, _, test_loader, class_weights = create_dataloaders()
+    components = initialize_training_components(class_weights=class_weights)
+    components = _load_best_model(components, checkpoint_path)
+    model = components.model
+    device = components.device
+
+    # Collect max confidence and correctness for every test prediction.
+    model.eval()
+    confidences: List[float] = []
+    correctness: List[int]   = []
+
+    with torch.no_grad():
+        for videos, _, ef_classes in test_loader:
+            videos    = videos.to(device, non_blocking=True)
+            ef_classes = ef_classes.to(device, non_blocking=True)
+            _, logits = model(videos)
+            probs      = torch.softmax(logits, dim=1)
+            conf, pred = probs.max(dim=1)
+            correct    = (pred == ef_classes).long()
+
+            confidences.extend(conf.cpu().tolist())
+            correctness.extend(correct.cpu().tolist())
+
+    conf_arr = np.array(confidences)
+    corr_arr = np.array(correctness, dtype=float)
+    n_total  = len(conf_arr)
+
+    # ── ECE calculation ───────────────────────────────────────────────────────
+    bin_edges  = np.linspace(0.0, 1.0, n_bins + 1)
+    bin_accs   = np.zeros(n_bins)
+    bin_confs  = np.zeros(n_bins)
+    bin_counts = np.zeros(n_bins, dtype=int)
+
+    for i in range(n_bins):
+        lo, hi = bin_edges[i], bin_edges[i + 1]
+        mask = (conf_arr >= lo) & (conf_arr < hi)
+        if i == n_bins - 1:
+            mask = (conf_arr >= lo) & (conf_arr <= hi)  # include 1.0 in last bin
+        n_bin = int(mask.sum())
+        if n_bin == 0:
+            continue
+        bin_counts[i] = n_bin
+        bin_accs[i]   = corr_arr[mask].mean()
+        bin_confs[i]  = conf_arr[mask].mean()
+
+    ece = float(np.sum(bin_counts / n_total * np.abs(bin_accs - bin_confs)))
+
+    print("\n" + "=" * 60)
+    print("CALIBRATION ANALYSIS")
+    print("=" * 60)
+    print(f"  Expected Calibration Error (ECE): {ece:.4f}")
+    print(f"  (0 = perfect calibration, 1 = worst)")
+    print()
+    print(f"  {'Bin':>12}  {'N':>5}  {'Conf':>7}  {'Acc':>7}  {'Gap':>7}")
+    print("  " + "-" * 50)
+    for i in range(n_bins):
+        if bin_counts[i] == 0:
+            continue
+        lo = bin_edges[i]
+        hi = bin_edges[i + 1]
+        gap = bin_accs[i] - bin_confs[i]
+        print(f"  [{lo:.1f}–{hi:.1f}]   {bin_counts[i]:>5}  {bin_confs[i]:>7.3f}  "
+              f"{bin_accs[i]:>7.3f}  {gap:>+7.3f}")
+    print("=" * 60)
+
+    # ── Reliability diagram ───────────────────────────────────────────────────
+    fig, ax = plt.subplots(figsize=(6, 6))
+
+    # Diagonal = perfect calibration
+    ax.plot([0, 1], [0, 1], "k--", linewidth=1.5, label="Perfect calibration")
+
+    # Gap fill: area between actual and perfect
+    non_empty = bin_counts > 0
+    ax.bar(bin_confs[non_empty], bin_accs[non_empty],
+           width=(bin_edges[1] - bin_edges[0]) * 0.8,
+           alpha=0.7, color="steelblue", label="Model accuracy per bin")
+    ax.bar(bin_confs[non_empty],
+           bin_confs[non_empty] - bin_accs[non_empty],
+           bottom=bin_accs[non_empty],
+           width=(bin_edges[1] - bin_edges[0]) * 0.8,
+           alpha=0.3, color="red", label="Calibration gap")
+
+    ax.set_xlabel("Mean Predicted Confidence")
+    ax.set_ylabel("Empirical Accuracy")
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    ax.set_title(f"Reliability Diagram (ECE = {ece:.4f})")
+    ax.legend(fontsize=9)
+    fig.tight_layout()
+    cal_path = output_dir / "calibration_reliability.png"
+    fig.savefig(cal_path, dpi=150)
+    plt.close(fig)
+    print(f"Calibration reliability diagram saved \u2192 {cal_path}")
+
+    return {
+        "ece": ece,
+        "bin_accuracies": bin_accs.tolist(),
+        "bin_confidences": bin_confs.tolist(),
+        "bin_counts": bin_counts.tolist(),
+    }
 
 

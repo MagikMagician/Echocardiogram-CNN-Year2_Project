@@ -7,7 +7,7 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
 
-from src.CNN_model import CNN3D, R2Plus1DEF
+from src.CNN_model import R2Plus1DEF
 from src.config import Config
 
 config = Config()
@@ -39,9 +39,10 @@ def _empty_epoch_metrics() -> EpochMetrics:
     }
 
 
-# ==============================================================================
-# STEP 5: INITIALIZE MODEL, LOSS, OPTIMIZER
-# ==============================================================================
+# =============================================================================
+# Model setup — R(2+1)D network, losses, SGD optimiser, and LR scheduler.
+# Hyperparameters follow the EchoNet-Dynamic paper (Ouyang et al., 2020).
+# =============================================================================
 
 
 def initialize_training_components(
@@ -52,10 +53,10 @@ def initialize_training_components(
     """Initialize model, losses, optimizer, and scheduler."""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # R2+1D with Kinetics-400 pretrained weights (EchoNet-Dynamic paper).
+    # Pretrained on Kinetics-400; input conv already adapted for grayscale.
     model = R2Plus1DEF(num_classes=num_classes).to(device)
     regression_loss_fn = nn.MSELoss()
-    # Move class weights to the same device so the loss computation stays on GPU.
+    # Class weights must live on the same device as the model outputs.
     classification_loss_fn = nn.CrossEntropyLoss(
         weight=class_weights.to(device) if class_weights is not None else None
     )
@@ -74,9 +75,10 @@ def initialize_training_components(
     )
 
 
-# ==============================================================================
-# STEP 6: TRAINING LOOP
-# ==============================================================================
+# =============================================================================
+# Training & validation loop — runs epochs with early stopping and saves the
+# best checkpoint by validation loss.
+# =============================================================================
 
 
 def _run_epoch(
@@ -101,7 +103,7 @@ def _run_epoch(
     total_samples = 0
 
     for videos, ef_values, ef_classes in loader:
-        # Keep tensors on the same device as the model for fast forward/backward passes.
+        # Move each batch to the accelerator before the forward pass.
         videos = videos.to(components.device, non_blocking=True)
         ef_values = ef_values.to(components.device, non_blocking=True)
         ef_classes = ef_classes.to(components.device, non_blocking=True)
@@ -122,7 +124,8 @@ def _run_epoch(
                 components.optimizer.step()
 
         batch_size = videos.size(0)
-        # Aggregate weighted by batch size so epoch averages are correct.
+        # Weight accumulation by batch size keeps the epoch average correct
+        # even when the last batch is smaller than the rest.
         total_samples += batch_size
         total_loss += loss.item() * batch_size
         total_regression_loss += regression_loss.item() * batch_size
@@ -169,7 +172,6 @@ def train_model(
     epochs_without_improvement = 0
 
     for epoch in range(1, num_epochs + 1):
-        # Train first, then validate with the same metric pipeline.
         train_metrics = _run_epoch(
             loader=train_loader,
             components=components,
@@ -186,7 +188,7 @@ def train_model(
         )
 
         if components.scheduler is not None:
-            # StepLR steps unconditionally each epoch.
+            # StepLR advances unconditionally — no metric condition required.
             components.scheduler.step()
 
         history["train_loss"].append(train_metrics["loss"])
@@ -205,7 +207,7 @@ def train_model(
         )
 
         if val_metrics["loss"] < best_val_loss:
-            # Save the best model seen so far for later evaluation.
+            # New best — overwrite the checkpoint and reset the patience counter.
             best_val_loss = val_metrics["loss"]
             epochs_without_improvement = 0
             torch.save(
@@ -214,6 +216,8 @@ def train_model(
                     "model_state_dict": components.model.state_dict(),
                     "optimizer_state_dict": components.optimizer.state_dict(),
                     "val_loss": best_val_loss,
+                    "val_mae": val_metrics["mae"],
+                    "val_accuracy": val_metrics["accuracy"],
                 },
                 checkpoint_path,
             )
