@@ -3,6 +3,24 @@ import torch.nn as nn
 from torchvision.models.video import r2plus1d_18, R2Plus1D_18_Weights
 from typing import Tuple
 class R2Plus1DEF(nn.Module):
+    This class implements a modified R(2+1)D-18 architecture from:
+        Tran, D., Wang, H., Torresani, L., Ray, J., LeCun, Y., & Feichtenhofer, C. (2018).
+        "A Closer Look at Spatiotemporal Convolutions for Action Recognition."
+        In Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR).
+        https://arxiv.org/abs/1711.11248
+    The architecture adapts the pretrained RGB model for single-channel echocardiogram input
+    by averaging the first-layer weights across the colour dimension, preserving Kinetics-400
+    pretraining knowledge.
+    The model uses a two-task learning design with task-specific heads that share a common
+    temporal embedding:
+        - regression_head: predicts continuous ejection fraction (EF) in [0, 1]
+        - classification_head: predicts discrete EF category via C-class logits
+    Attributes:
+        backbone (nn.Sequential): Feature extraction layers from R(2+1)D-18
+        shared_head (nn.Sequential or nn.Flatten): Optional shared MLP embedding
+        regression_head (nn.Linear): Continuous EF prediction layer
+        classification_head (nn.Linear): Categorical EF prediction layer
+        use_shared_head (bool): Whether to use MLP embedding or direct linear projection
     """
     R(2+1)D-18 backbone (Tran et al., 2018) pre-trained on Kinetics-400.
     Adapts the RGB model for single-channel echocardiogram input by averaging

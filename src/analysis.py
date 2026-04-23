@@ -81,9 +81,19 @@ def _collect_predictions(
             ef_reg, ef_logits = model(videos)
 
             ef_trues.append(ef_values.numpy())
-            ef_preds.append(ef_reg.cpu().numpy())
+            ef_pred_np = ef_reg.cpu().numpy()
+            ef_preds.append(ef_pred_np)
             cat_trues.append(ef_classes.numpy())
-            cat_preds.append(ef_logits.argmax(dim=1).cpu().numpy())
+            # Derive category from regression prediction using the same clinical
+            # thresholds as the ground-truth labels. The regression head receives
+            # 10× more gradient signal than the classification head (weight 1.0
+            # vs 0.1), so its continuous output is a more reliable boundary
+            # discriminator, especially for the small mildly-reduced class.
+            cat_from_reg = (
+                (ef_pred_np >= config.EF_REDUCED_THRESHOLD).astype(int)
+                + (ef_pred_np >= config.EF_MILDLY_REDUCED_THRESHOLD).astype(int)
+            )
+            cat_preds.append(cat_from_reg)
 
     return (
         np.concatenate(ef_trues),
