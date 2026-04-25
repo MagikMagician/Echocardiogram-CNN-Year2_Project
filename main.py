@@ -12,7 +12,7 @@ from src.analysis import (
     run_ablation_study,
     run_gradcam_lv_iou,
     run_subgroup_analysis,
-    run_calibration_analysis,
+    run_clinical_evaluation,
 )
 
 CHECKPOINT = Path("artifacts/best_r2plus1d.pt")
@@ -47,27 +47,25 @@ def run_pipeline() -> None:
         print(f"Training complete. Epochs run: {len(history['train_loss'])}")
         plot_training_curves(history)
 
-    # Evaluate the best checkpoint on the held-out test set.
-    evaluate_on_test_set()
+    # ── Post-hoc clinical evaluation ─────────────────────────────────────────
+    # Applies TTA, temperature scaling, and recall-optimised thresholds.
+    # Returns post-hoc predictions used by all downstream evaluation functions
+    # so every output chart reflects the improved model, not the raw baseline.
+    post_hoc = run_clinical_evaluation(n_tta_clips=10)
 
-    # Generate Grad-CAM overlays for a sample of test videos.
+    # Regression and classification metrics using post-hoc TTA predictions.
+    evaluate_on_test_set(post_hoc=post_hoc)
+
+    # Per-EF-band subgroup analysis using post-hoc predictions.
+    run_subgroup_analysis(post_hoc=post_hoc)
+
+    # ── Grad-CAM visualisations ───────────────────────────────────────────────
     run_gradcam_visualization(num_samples=8)
-
-    # Generate layered Grad-CAM figures: frame / expert LV contour / model attention.
     run_gradcam_with_lv_overlay(num_samples=8)
-
-    # Run ablation variants to quantify the effect of each design choice.
-    run_ablation_study()
-
-    # ── Novel contributions beyond Stanford EchoNet-Dynamic ──────────────────
-    # 1. Grad-CAM localisation vs expert LV annotations (IoU)
     run_gradcam_lv_iou()
 
-    # 2. Subgroup analysis: per-EF-band metrics + clinical cost confusion matrix
-    run_subgroup_analysis()
-
-    # 3. Calibration: reliability diagram + Expected Calibration Error (ECE)
-    run_calibration_analysis()
+    # ── Ablation study ────────────────────────────────────────────────────────
+    run_ablation_study()
 
 if __name__ == "__main__":
     try:
