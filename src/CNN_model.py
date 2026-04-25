@@ -2,6 +2,7 @@
 import torch.nn as nn
 from torchvision.models.video import r2plus1d_18, R2Plus1D_18_Weights
 from typing import Tuple
+
 class R2Plus1DEF(nn.Module):
     """
     R(2+1)D-18 backbone (Tran et al., 2018) pre-trained on Kinetics-400.
@@ -12,7 +13,6 @@ class R2Plus1DEF(nn.Module):
         - regression_head  — outputs a scalar EF in R
         - classification_head — outputs C logits for EF category prediction
     """
-
     def __init__(
         self,
         num_classes: int = 3,
