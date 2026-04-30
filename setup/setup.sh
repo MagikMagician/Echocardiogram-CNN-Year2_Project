@@ -19,7 +19,7 @@ source venv/bin/activate
 
 echo "Installing dependencies..."
 python -m pip install --upgrade pip
-pip install -r requirements.txt
+pip install -r "$(dirname "$0")/requirements.txt"
 
 echo ""
 echo "Setup complete!"

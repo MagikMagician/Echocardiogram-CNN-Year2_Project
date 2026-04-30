@@ -18,7 +18,7 @@ call venv\Scripts\activate.bat
 
 echo Installing dependencies...
 python -m pip install --upgrade pip
-pip install -r requirements.txt
+pip install -r "%~dp0requirements.txt"
 
 echo.
 echo Setup complete!
