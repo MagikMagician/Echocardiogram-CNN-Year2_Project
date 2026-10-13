@@ -4,9 +4,8 @@ Year 2 undergraduate group project investigating automated left ventricular ejec
 
 This work reproduces and extends the EchoNet-Dynamic pipeline (Ouyang et al., 2020) using a pretrained R(2+1)D-18 backbone (Tran et al., 2018), adapted for single-channel grayscale input and augmented with a dual-task shared-head architecture, post-hoc clinical calibration, and Grad-CAM saliency analysis.
 
-The accompanying report is included in this repository: [Ejection Fraction Estimation Using an R(2+1)D-18 Convoluted Neural Network.pdf](Ejection%20Fraction%20Estimation%20Using%20an%20R(2%2B1)D-18%20Convoluted%20Neural%20Network.pdf)
+The accompanying report is included in this repository: [Ejection Fraction Estimation Using an R(2+1)D-18 Convoluted Neural Network.pdf](reports/Ejection%20Fraction%20Estimation%20Using%20an%20R(2%2B1)D-18%20Convoluted%20Neural%20Network.pdf)
 
-Alternatively, the report can be accessed via this google docs link: https://docs.google.com/document/d/1zxTxfIn8gz3CGrnyXiZFyz3EvudQl-NB-aeE2nDDSbE/edit?usp=sharing
 
 ---
 
