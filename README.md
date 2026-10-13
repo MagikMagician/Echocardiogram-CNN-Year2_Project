@@ -6,6 +6,8 @@ This work reproduces and extends the EchoNet-Dynamic pipeline (Ouyang et al., 20
 
 The accompanying report is included in this repository: [Ejection Fraction Estimation Using an R(2+1)D-18 Convoluted Neural Network.docx](Ejection%20Fraction%20Estimation%20Using%20an%20R(2%2B1)D-18%20Convoluted%20Neural%20Network.docx)
 
+Alternatively, the report can be accessed via this google docs link: https://docs.google.com/document/d/1zxTxfIn8gz3CGrnyXiZFyz3EvudQl-NB-aeE2nDDSbE/edit?usp=sharing
+
 ---
 
 ## Overview
@@ -163,4 +165,4 @@ This work builds on:
 
 ## Notes
 
-This was a group undergraduate coursework submission. Contributions from all group members are reflected in the git history.
+This was a group undergraduate coursework submission. Not all contributions from group members are reflected in the git history.
