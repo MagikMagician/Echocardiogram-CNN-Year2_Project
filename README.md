@@ -38,7 +38,7 @@ A shared multilayer perceptron (MLP) produces an embedding for two parallel outp
 The two tasks are trained jointly using a weighted combination of mean squared error and cross-entropy loss.
 
 ```mermaid
-flowchart TD
+flowchart LR
     A["32 Grayscale Frames<br/>112 × 112"] --> B["R(2+1)D-18<br/>Kinetics-400 Pretrained"]
     B --> C["Shared MLP<br/>512 → 256 → 128"]
     C --> D["Regression Head<br/>Continuous EF Prediction"]
