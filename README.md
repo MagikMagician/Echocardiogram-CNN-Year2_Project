@@ -1,167 +1,196 @@
 # Ejection Fraction Estimation Using an R(2+1)D-18 CNN
 
-Year 2 undergraduate group project investigating automated left ventricular ejection fraction (EF) estimation from echocardiogram video using a spatiotemporal convolutional neural network.
+A second-year undergraduate group research project exploring automated left ventricular ejection fraction (LVEF) estimation from echocardiogram videos using a spatiotemporal convolutional neural network (CNN).
 
-This work reproduces and extends the EchoNet-Dynamic pipeline (Ouyang et al., 2020) using a pretrained R(2+1)D-18 backbone (Tran et al., 2018), adapted for single-channel grayscale input and augmented with a dual-task shared-head architecture, post-hoc clinical calibration, and Grad-CAM saliency analysis.
+The project reproduces and extends Stanford's EchoNet-Dynamic approach (Ouyang et al., 2020), using a Kinetics-400-pretrained R(2+1)D-18 backbone for video-based EF regression and clinical classification. Additional experiments investigate multi-task learning, calibration, uncertainty-aware inference and model interpretability.
 
-The accompanying report is included in this repository: [Ejection Fraction Estimation Using an R(2+1)D-18 Convoluted Neural Network.pdf](reports/Ejection%20Fraction%20Estimation%20Using%20an%20R(2%2B1)D-18%20Convoluted%20Neural%20Network.pdf)
-
-
----
+**Research report:** [Read the full paper](reports/Ejection%20Fraction%20Estimation%20Using%20an%20R(2%2B1)D-18%20Convoluted%20Neural%20Network.pdf)
 
 ## Overview
 
-Ejection fraction — the percentage of blood pumped from the left ventricle per beat — is a critical clinical biomarker for heart failure diagnosis. Manual estimation from echocardiography is time-consuming and subject to inter-observer variability. This project explores whether a spatiotemporal deep learning model can replicate cardiologist-level EF estimation reliably.
+Left ventricular ejection fraction is the percentage of blood pumped out of the left ventricle with each heartbeat. Estimating EF from echocardiograms is important for assessing cardiac function, but manual measurements can be time-consuming and dependent on image quality and operator expertise.
 
-**Task:** Simultaneous EF regression (continuous value) and classification into three clinical categories:
+Using the EchoNet-Dynamic dataset, this project investigates whether a deep learning model can estimate EF directly from ultrasound video while identifying uncertain predictions for expert review.
 
-| Category | EF Range |
+**Key results on the test set:**
+
+| Metric | Result |
+|---|---:|
+| Mean Absolute Error (MAE) | 4.10 percentage points |
+| Root Mean Squared Error (RMSE) | 5.55 percentage points |
+| Coefficient of Determination (\(R^2\)) | 0.794 |
+| Classification accuracy (post-hoc evaluation) | 80.6% |
+| Accuracy on retained predictions at 75.7% coverage | 95% |
+
+The uncertainty-aware evaluation defers approximately 24% of cases for clinician review rather than attempting to classify every case automatically. These results are from an experimental research pipeline, not a clinically validated diagnostic system.
+
+## Model Architecture
+
+The model uses an **R(2+1)D-18** backbone pretrained on Kinetics-400. It factorises 3D convolutions into separate spatial and temporal operations, allowing it to learn both cardiac appearance and motion over time.
+
+The network accepts 32 grayscale frames at 112 × 112 resolution. The pretrained input convolution is adapted from three colour channels to one by averaging its RGB weights.
+
+A shared multilayer perceptron (MLP) produces an embedding for two parallel output heads:
+
+- **Regression:** predicts a continuous EF value.
+- **Classification:** predicts one of three clinical EF categories.
+
+The two tasks are trained jointly using a weighted combination of mean squared error and cross-entropy loss.
+
+```mermaid
+flowchart TD
+    A["32 Grayscale Frames<br/>112 × 112"] --> B["R(2+1)D-18<br/>Kinetics-400 Pretrained"]
+    B --> C["Shared MLP<br/>512 → 256 → 128"]
+    C --> D["Regression Head<br/>Continuous EF Prediction"]
+    C --> E["Classification Head<br/>3 Clinical EF Categories"]
+```
+
+### Clinical Categories
+
+| Category | EF range |
 |---|---|
-| Reduced | < 40% |
-| Mildly Reduced | 40 – 49% |
-| Preserved | ≥ 50% |
+| Reduced | Below 40% |
+| Mildly Reduced | 40–49% |
+| Preserved | 50% or above |
 
----
+## Key Features
 
-## Architecture
+- **Transfer learning:** adapts pretrained video-recognition weights to grayscale echocardiograms.
+- **Multi-task learning:** combines continuous EF regression with three-class classification using a shared representation.
+- **Video preprocessing and augmentation:** samples temporally consistent clips, resizes frames and applies spatial augmentation.
+- **Post-hoc calibration:** evaluates ten-clip test-time augmentation, temperature scaling and recall-aware classification thresholds.
+- **Uncertainty-aware inference:** uses classification confidence to defer uncertain predictions for expert review.
+- **Grad-CAM visualisation:** highlights image regions influencing predictions, supporting qualitative interpretability analysis.
+- **Ablation study:** compares the full model against reduced-frame, non-pretrained, regression-only and separate-head variants.
+- **Statistical evaluation:** reports regression and classification metrics, subgroup performance and 95% bootstrap confidence intervals.
 
-The model is built on an **R(2+1)D-18** backbone pretrained on Kinetics-400. The original RGB input convolution is adapted for single-channel echocardiogram input by averaging the pretrained weight tensor across the colour dimension, preserving Kinetics-400 representations without discarding any weights.
+## Ablation Study
 
-A **shared MLP embedding** (512 → 256 → 128) feeds two task-specific heads in parallel:
+The experiments investigate the contribution of key architectural and training choices.
 
-- `regression_head` — scalar EF prediction
-- `classification_head` — 3-class logits
+| Configuration | MAE | Classification accuracy |
+|---|---:|---:|
+| Full model (32 frames) | 4.10% | 87.1% |
+| 16-frame input | 4.62% | 84.6% |
+| No pretraining | 10.24% | 80.9% |
+| Regression-only | 4.38% | 77.6% |
+| No shared head | 4.19% | 84.4% |
 
-This dual-head design extends the original Stanford single-head approach and is evaluated against ablated variants.
+*These ablation results use the default classification thresholds without test-time augmentation or temperature scaling, so they are not directly comparable with the post-hoc calibrated results above.*
 
-```
-Input (B, 1, T, H, W)
-       │
-  R(2+1)D-18 backbone
-       │
-  Shared MLP (512→256→128)
-     ┌──┴──┐
-  Regression  Classification
-   Head (1)    Head (3)
-```
-
----
-
-## Key Extensions Beyond the Original Paper
-
-- **Dual-task shared head** — joint regression and classification from a shared embedding
-- **Grayscale weight averaging** — preserves Kinetics-400 pretraining for single-channel input
-- **Post-hoc clinical calibration** — test-time augmentation (10 clips), temperature scaling, and recall-optimised classification thresholds
-- **Grad-CAM saliency analysis** — temporal activation maps with left-ventricular contour overlay and IoU evaluation against VolumeTracings annotations
-- **Ablation study** — four controlled variants: baseline (16-frame), no pretraining, no shared head, regression-only
-- **Per-EF-band subgroup analysis** — disaggregated performance across the EF distribution
-- **95% bootstrap confidence intervals** — on all reported metrics
-
----
+The largest regression performance drop occurred without Kinetics-400 pretraining, highlighting the importance of transfer learning for this medical video task.
 
 ## Repository Structure
 
-```
-├── main.py                  # Full training + evaluation pipeline entry point
+```text
+├── main.py                  # Training and evaluation entry point
 ├── app/
-│   └── start.py             # customtkinter GUI for single-video inference
+│   └── start.py             # GUI for single-video inference
 ├── src/
-│   ├── CNN_model.py         # R(2+1)D-18 dual-head architecture
-│   ├── config.py            # All hyperparameters and paths
-│   ├── data_processing.py   # EchoNet-Dynamic dataloader and augmentation
-│   ├── training.py          # Training loop, optimiser, LR scheduler
-│   └── analysis.py          # Evaluation, Grad-CAM, ablation, subgroup analysis
+│   ├── CNN_model.py         # R(2+1)D-18 model architecture
+│   ├── config.py            # Hyperparameters and dataset paths
+│   ├── data_processing.py   # Dataset loading and preprocessing
+│   ├── training.py          # Training loop and optimisation
+│   └── analysis.py          # Evaluation and analysis tools
 ├── artifacts/
 │   ├── best_r2plus1d.pt     # Best model checkpoint
 │   ├── dataset_statistics.json
-│   ├── ablation/            # Ablation variant checkpoints
-│   ├── evaluation/          # Test set predictions CSV
-│   └── gradcam/             # Saved Grad-CAM visualisations
-├── dataset/                 # EchoNet-Dynamic dataset (not included — see below)
+│   ├── ablation/            # Ablation checkpoints
+│   ├── evaluation/          # Test predictions
+│   └── gradcam/             # Visualisation outputs
+├── dataset/                 # Dataset files (not included)
+├── reports/
+│   └── Ejection Fraction Estimation Using an R(2+1)D-18
+│       Convoluted Neural Network.pdf
 └── setup/
     ├── requirements.txt
-    ├── setup.bat            # Windows setup script
-    └── setup.sh             # Linux/macOS setup script
+    ├── setup.bat            # Windows setup
+    └── setup.sh             # Linux/macOS setup
 ```
 
----
+## Setup and Usage
 
-## Setup
+### 1. Download the Dataset
 
-### 1. Dataset
-
-Download the **EchoNet-Dynamic** dataset from Kaggle and place the contents inside the `dataset/` directory:
-
-> https://www.kaggle.com/datasets/mahnurrahman/echonet-dynamic
+Download [EchoNet-Dynamic from Kaggle](https://www.kaggle.com/datasets/mahnurrahman/echonet-dynamic) and place the dataset files in the `dataset/` directory.
 
 Expected structure:
-```
+
+```text
 dataset/
 ├── FileList.csv
 ├── VolumeTracings.csv
 └── Videos/
 ```
 
-If your dataset lives elsewhere, create a `local_config.json` in the project root:
+To use a different dataset location, create `local_config.json` in the project root:
+
 ```json
-{ "DATASET_PATH": "/path/to/your/dataset" }
+{
+  "DATASET_PATH": "/path/to/your/dataset"
+}
 ```
 
-### 2. Environment
+### 2. Install Dependencies
 
-**Windows:**
+**Windows**
+
 ```bat
 setup\setup.bat
 ```
 
-**Linux / macOS:**
+**Linux / macOS**
+
 ```bash
 chmod +x setup/setup.sh
 ./setup/setup.sh
 ```
 
-This creates a virtual environment and installs all dependencies. PyTorch is listed for CUDA 12.8 — adjust the index URL in `requirements.txt` for your CUDA version if needed.
+The setup scripts create a virtual environment and install the required dependencies. Check `setup/requirements.txt` for the PyTorch and CUDA configuration and adjust it to match your system if necessary.
 
-### 3. Run
+### 3. Run the Pipeline
 
-**Full pipeline** (training + evaluation + Grad-CAM + ablation):
+Activate the virtual environment, then run:
+
 ```bash
 python main.py
 ```
 
-Training is skipped automatically if `artifacts/best_r2plus1d.pt` already exists.
+The pipeline orchestrates training, evaluation, calibration, Grad-CAM analysis and ablation experiments. Training is skipped automatically if `artifacts/best_r2plus1d.pt` already exists.
 
-**GUI inference app:**
+### 4. Run the Inference GUI
+
 ```bash
 python app/start.py
 ```
 
----
+The GUI provides an interface for running inference on an individual echocardiogram video.
 
-## Hyperparameters
+## Training Configuration
 
-| Parameter | Value | Notes |
-|---|---|---|
-| Backbone | R(2+1)D-18 | Kinetics-400 pretrained |
-| Input frames | 32 | Sampled every 2nd frame |
-| Frame size | 112 × 112 | |
-| Batch size | 16 | |
-| Optimiser | SGD | Following Ouyang et al. |
-| Learning rate | 1e-4 | Linear scaling rule applied |
-| Epochs | 45 | Early stopping patience = 10 |
-| Dropout | 0.5 | In shared MLP |
+| Parameter | Value |
+|---|---|
+| Backbone | R(2+1)D-18, Kinetics-400 pretrained |
+| Input | 32 grayscale frames, 112 × 112 |
+| Batch size | 16 |
+| Optimiser | SGD, momentum 0.9 |
+| Initial learning rate | 1 × 10⁻⁴ |
+| Learning-rate scheduler | StepLR, factor 0.1 every 15 epochs |
+| Maximum epochs | 45 |
+| Early stopping | Patience of 10 epochs |
+| Dropout | 0.5 |
 
----
+The model was implemented in PyTorch and trained on an NVIDIA RTX 5090 GPU. Hyperparameters and paths are centralised in `src/config.py`.
 
-## Citation / Reference
+## References
 
-This work builds on:
+- Ouyang, D. et al. (2020). *Video-based AI for beat-to-beat assessment of cardiac function.* Nature, 580, 252–256.
+- Tran, D. et al. (2018). *A Closer Look at Spatiotemporal Convolutions for Action Recognition.* CVPR.
 
-- Ouyang, D. et al. (2020). *Video-based AI for beat-to-beat assessment of cardiac function*. Nature, 580, 252–256.
-- Tran, D. et al. (2018). *A Closer Look at Spatiotemporal Convolutions for Action Recognition*. CVPR.
+## Limitations
 
----
+This project uses a single dataset and has not undergone external multi-site validation or prospective clinical evaluation. Performance can degrade with poor image quality, obscured ventricular boundaries and borderline EF values. Softmax confidence is an imperfect measure of uncertainty, and the model is intended for research into clinical decision support rather than replacing clinicians.
 
-## Notes
+## Acknowledgements
 
-This was a group undergraduate coursework submission. Not all contributions from group members are reflected in the git history.
+This was a second-year undergraduate group coursework project. The accompanying research paper documents the methodology, experiments, results and limitations. Git history may not fully represent each group member's contributions.
